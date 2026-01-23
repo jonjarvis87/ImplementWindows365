@@ -25,7 +25,10 @@ param(
     [int]$CloudPCTypeChoice,
     
     [Parameter()]
-    [int]$RegionChoice
+    [int]$RegionChoice,
+    
+    [Parameter()]
+    [string]$Language = ""
 )
 
 # ----------------------------
@@ -333,7 +336,8 @@ function Get-OrCreateProvisioningPolicy {
         [Parameter(Mandatory)] [string]$RegionGroup,
         [Parameter(Mandatory)] [string]$CountryRegion,
         [Parameter(Mandatory)] [string]$ImageId,
-        [Parameter(Mandatory)] [string]$ImageDisplayName
+        [Parameter(Mandatory)] [string]$ImageDisplayName,
+        [Parameter()] [string]$Language = "en-GB"
     )
 
     # Validate required parameters
@@ -374,7 +378,7 @@ function Get-OrCreateProvisioningPolicy {
 
         if (-not $existing) {
             Write-Host "Creating Provisioning Policy: $DisplayName" -ForegroundColor Yellow
-            Write-Verbose "RegionGroup parameter: $RegionGroup | RegionName parameter: $RegionName"
+            Write-Verbose "RegionGroup parameter: $RegionGroup | CountryRegion parameter: $CountryRegion"
 
             $params = @{
                 displayName        = $DisplayName
@@ -398,7 +402,7 @@ function Get-OrCreateProvisioningPolicy {
                     }
                 )
                 windowsSettings = @{
-                    language = "en-US"
+                    language = $Language
                 }
                 cloudPcNamingTemplate = $null
                 scopeIds = @("0")
@@ -828,23 +832,34 @@ Write-Host "`nRetrieving available Windows 365 images..." -ForegroundColor Cyan
 try {
     $images = @()
 
-    if (Get-Command Get-MgDeviceManagementVirtualEndpointDeviceImage -ErrorAction SilentlyContinue) {
-        try {
-            $images = Get-MgDeviceManagementVirtualEndpointDeviceImage -All -ErrorAction Stop
-        }
-        catch {
-            # Fallback without -All if not supported
-            $images = Get-MgDeviceManagementVirtualEndpointDeviceImage -ErrorAction Stop
-        }
+    # Try gallery images endpoint first (more reliable for Microsoft gallery images)
+    try {
+        Write-Verbose "Attempting to retrieve gallery images..."
+        $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/galleryImages"
+        Write-Verbose "Retrieved $($images.Count) images from gallery endpoint"
     }
-    else {
-        # Fallback to direct Graph call (beta) if cmdlet is unavailable, with paging
-        try {
-            $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/deviceImages"
+    catch {
+        Write-Verbose "Gallery images endpoint failed, trying device images endpoint: $_"
+        
+        # Fallback to device images endpoint
+        if (Get-Command Get-MgDeviceManagementVirtualEndpointDeviceImage -ErrorAction SilentlyContinue) {
+            try {
+                $images = Get-MgDeviceManagementVirtualEndpointDeviceImage -All -ErrorAction Stop
+            }
+            catch {
+                # Fallback without -All if not supported
+                $images = Get-MgDeviceManagementVirtualEndpointDeviceImage -ErrorAction Stop
+            }
         }
-        catch {
-            Write-Verbose "Beta endpoint failed, trying v1 endpoint..."
-            $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/v1.0/deviceManagement/virtualEndpoint/deviceImages"
+        else {
+            # Fallback to direct Graph call (beta) if cmdlet is unavailable, with paging
+            try {
+                $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/deviceImages"
+            }
+            catch {
+                Write-Verbose "Beta endpoint failed, trying v1 endpoint..."
+                $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/v1.0/deviceManagement/virtualEndpoint/deviceImages"
+            }
         }
     }
 
@@ -858,8 +873,10 @@ try {
         }
     }
     else {
-        # Filter for available images (status = available)
-        $availableImages = $images | Where-Object { $_.Status -eq "available" }
+        # Filter out unsupported images - keep supported, supportedWithWarning, or images without status property
+        $availableImages = $images | Where-Object { 
+            -not $_.Status -or $_.Status -ne "notSupported"
+        }
 
         if (-not $availableImages -or $availableImages.Count -eq 0) {
             Write-Warning "No available device images found. All images may be in processing or error state."
@@ -876,7 +893,7 @@ try {
         # Select image
         Write-Host "`nChoose a Windows 11 image by selecting its corresponding number:" -ForegroundColor Green
         for ($i = 0; $i -lt $availableImages.Count; $i++) {
-            $status = if ($availableImages[$i].Status -eq "available") { "" } else { " [Status: $($availableImages[$i].Status)]" }
+            $status = if ($availableImages[$i].Status -eq "available") { "" } elseif ($availableImages[$i].Status) { " [Status: $($availableImages[$i].Status)]" } else { "" }
             Write-Host ("{0,2}. {1}{2}" -f ($i + 1), $availableImages[$i].DisplayName, $status)
         }
         Write-Host ""
@@ -900,6 +917,55 @@ catch {
     Write-Error "Failed to retrieve device images: $_"
     Write-Verbose "Error details: $($_ | Out-String)"
     throw
+}
+
+# Language selection
+$SupportedLanguages = @(
+    @{ DisplayName = "English (United States)"; Code = "en-US" },
+    @{ DisplayName = "English (United Kingdom)"; Code = "en-GB" },
+    @{ DisplayName = "Spanish (Spain)"; Code = "es-ES" },
+    @{ DisplayName = "Spanish (Mexico)"; Code = "es-MX" },
+    @{ DisplayName = "French (France)"; Code = "fr-FR" },
+    @{ DisplayName = "French (Canada)"; Code = "fr-CA" },
+    @{ DisplayName = "German (Germany)"; Code = "de-DE" },
+    @{ DisplayName = "Italian (Italy)"; Code = "it-IT" },
+    @{ DisplayName = "Portuguese (Brazil)"; Code = "pt-BR" },
+    @{ DisplayName = "Portuguese (Portugal)"; Code = "pt-PT" },
+    @{ DisplayName = "Dutch (Netherlands)"; Code = "nl-NL" },
+    @{ DisplayName = "Russian (Russia)"; Code = "ru-RU" },
+    @{ DisplayName = "Japanese (Japan)"; Code = "ja-JP" },
+    @{ DisplayName = "Korean (Korea)"; Code = "ko-KR" },
+    @{ DisplayName = "Chinese (Simplified)"; Code = "zh-CN" },
+    @{ DisplayName = "Chinese (Traditional)"; Code = "zh-TW" },
+    @{ DisplayName = "Arabic (Saudi Arabia)"; Code = "ar-SA" },
+    @{ DisplayName = "Hindi (India)"; Code = "hi-IN" },
+    @{ DisplayName = "Polish (Poland)"; Code = "pl-PL" },
+    @{ DisplayName = "Turkish (Turkey)"; Code = "tr-TR" }
+)
+
+if ([string]::IsNullOrWhiteSpace($Language)) {
+    Write-Host "`nChoose your Windows 11 language by selecting its corresponding number:" -ForegroundColor Green
+    for ($i = 0; $i -lt $SupportedLanguages.Count; $i++) {
+        $selected = if ($SupportedLanguages[$i].Code -eq "en-GB") { " [Default]" } else { "" }
+        Write-Host ("{0,2}. {1}{2}" -f ($i + 1), $SupportedLanguages[$i].DisplayName, $selected)
+    }
+    Write-Host ""
+
+    $languageChoice = Get-ValidChoice -Min 1 -Max $SupportedLanguages.Count
+    $SelectedLanguage = $SupportedLanguages[$languageChoice - 1].Code
+    Write-Host "Selected language: $($SupportedLanguages[$languageChoice - 1].DisplayName)" -ForegroundColor Cyan
+}
+else {
+    # Validate provided language code
+    $languageFound = $SupportedLanguages | Where-Object { $_.Code -eq $Language }
+    if ($languageFound) {
+        $SelectedLanguage = $Language
+        Write-Host "Using language: $($languageFound.DisplayName)" -ForegroundColor Cyan
+    }
+    else {
+        Write-Warning "Language code '$Language' not recognized. Using default en-GB"
+        $SelectedLanguage = "en-GB"
+    }
 }
 
 # Groups - per Cloud PC Type
@@ -927,7 +993,7 @@ $policyRegionNameRaw  = if ($SelectedRegionDisplayName) { $SelectedRegionDisplay
 $policyRegionName     = (Get-Culture).TextInfo.ToTitleCase($policyRegionNameRaw.ToLower().Trim())
 
 $ProvisioningPolicyName = "$policyRegionName-W365-Enterprise-Provisioning Policy"
-$cloudPcProvisioningPolicyId = Get-OrCreateProvisioningPolicy -DisplayName $ProvisioningPolicyName -AssignGroupIds @($GroupIDAdmin, $GroupIDUser) -RegionGroup $SelectedRegionGroup -CountryRegion $SelectedCountryRegion -ImageId $SelectedImage.Id -ImageDisplayName $SelectedImage.DisplayName
+$cloudPcProvisioningPolicyId = Get-OrCreateProvisioningPolicy -DisplayName $ProvisioningPolicyName -AssignGroupIds @($GroupIDAdmin, $GroupIDUser) -RegionGroup $SelectedRegionGroup -CountryRegion $SelectedCountryRegion -ImageId $SelectedImage.Id -ImageDisplayName $SelectedImage.DisplayName -Language $SelectedLanguage
 
 Write-Host "`nDone ✅" -ForegroundColor Green
 Write-Host "Remember to assign the correct Windows 365 license to the groups created:" -ForegroundColor Yellow
