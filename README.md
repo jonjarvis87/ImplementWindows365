@@ -56,7 +56,8 @@ The script will prompt you to:
 1. Select a Windows 365 Cloud PC SKU (Enterprise plan options)
 2. Select a region group (Americas, Asia, Europe, etc.)
 3. Select a specific region within that group
-4. Select a Windows 11 device image
+4. Select a Windows 11 device image (unsupported images are automatically filtered out)
+5. Select a language for the Windows 11 environment
 
 ### Usage with Parameters
 
@@ -108,8 +109,8 @@ Creates a provisioning policy named:
 - Provisioning type: Dedicated
 - User experience: Cloud PC (full desktop)
 - Domain join: Azure AD join
-- Image: Selected Windows 11 enterprise image
-- Windows language: English (US)
+- Image: Selected Windows 11 enterprise image (supported or warning status only)
+- Windows language: Configurable (en-GB default, 20+ languages supported)
 - Assigned to: Both user and admin groups
 
 ## Key Features
@@ -168,6 +169,13 @@ License Assignment Required
 - Verify Windows 365 is available in your region
 - Check Microsoft Graph permissions
 - Some regions may not support Windows 365
+
+### "Only unsupported images are available"
+
+- This typically means no compatible images are available in your tenant
+- Check the Microsoft 365 admin center for image status
+- Wait for image processing to complete if recently uploaded
+- Contact Microsoft support if images remain unavailable
 
 ### "Failed to install Microsoft.Graph module"
 
