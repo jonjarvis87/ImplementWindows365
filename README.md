@@ -4,12 +4,12 @@ A comprehensive PowerShell script to deploy and configure Windows 365 Cloud PC e
 
 ## Overview
 
-`Deploy-Windows365.ps1` automates the complete setup of Windows 365 Cloud PC infrastructure. It handles:
+`Deploy-Windows365.ps1` automates the complete setup of Windows 365 Cloud PC infrastructure for both **Enterprise** and **Frontline**. It handles:
 
-- Entra ID security group creation/reuse for user and admin roles
-- Cloud PC user settings policies with local admin configuration
-- Cloud PC provisioning policies with regional deployment
-- Intelligent assignment preservation to avoid overwriting existing configurations
+- Entra ID security group creation/reuse for licensing, user, and admin roles (with new standardized naming)
+- Cloud PC user settings policies with local admin configuration and persistence options for Frontline Shared
+- Cloud PC provisioning policies with regional deployment (Enterprise assigned to groups; Frontline auto-assigned via license)
+- Intelligent assignment preservation for Enterprise to avoid overwriting existing configurations
 
 ## Prerequisites
 
@@ -53,11 +53,11 @@ Your Microsoft Entra ID account must have the following Microsoft Graph API scop
 ```
 
 The script will prompt you to:
-1. Select a Windows 365 Cloud PC SKU (Enterprise plan options)
-2. Select a region group (Americas, Asia, Europe, etc.)
-3. Select a specific region within that group
-4. Select a Windows 11 device image (unsupported images are automatically filtered out)
-5. Select a language for the Windows 11 environment
+1. Choose license type: **Enterprise** or **Frontline** (then Dedicated vs Shared for Frontline)
+2. Select a Windows 365 Cloud PC SKU (filtered to Enterprise or Frontline plans based on your choice)
+3. Select a region group (two-step: region group, then specific region)
+4. Select a Windows 11 device image (unsupported images are filtered; warnings are allowed)
+5. Select a language (20 options; falls back to en-GB with a warning if the selection is rejected by Graph)
 
 ### Usage with Parameters
 
@@ -68,7 +68,7 @@ The script will prompt you to:
 **Parameters:**
 - `-CloudPCTypeChoice` (int): SKU selection (1-based index from available plans)
 - `-RegionChoice` (int): Region selection (1-based index from available regions)
-  - Note: Region selection is always interactive - use the two-step prompt for specific region selection
+   - Note: Region selection remains interactive (two-step prompt) when not provided
 
 ### With Verbose Output
 
@@ -80,21 +80,23 @@ The script will prompt you to:
 
 ### Entra ID Security Groups
 
-The script creates three security groups:
+The script creates/reuses three security groups with standardized names:
 
-1. **`Windows365_Cloud_PC_Type`** - Merged group for all users and admins
-   - Used for assigning Windows 365 licenses
-   - Contains both standard users and administrators
+1. **Licensing (all users/admins for SKU)**
+   - `SG-W365CloudPC-<Cloud PC Type>`
+   - Assign Windows 365 licenses to this group (required)
 
-2. **`[Location]_Windows365_User`** - Location-specific user group
-   - Standard users for the specified region (e.g., `London_Windows365_User`)
-   - Assigned to the user settings policy (no local admin rights)
+2. **User settings group (per region)**
+   - Enterprise: `SG-W365ENT-<Region>-User`
+   - Frontline: `SG-W365FL-<Region>-User`
+   - Assigned to the standard user settings (no local admin rights)
 
-3. **`[Location]_Windows365_LocalAdmin`** - Location-specific admin group
-   - Administrator users for the specified region (e.g., `London_Windows365_LocalAdmin`)
-   - Assigned to the admin settings policy (with local admin rights)
+3. **Admin settings group (per region)**
+   - Enterprise: `SG-W365ENT-<Region>-Admin`
+   - Frontline: `SG-W365FL-<Region>-Admin`
+   - Assigned to the admin settings (with local admin rights)
 
-**Important:** You must assign the Windows 365 license to the `Windows365_Cloud_PC_Type` group after creation.
+**Important:** You must assign the Windows 365 license to `SG-W365CloudPC-<Cloud PC Type>` after creation. Frontline provisioning policies are applied via license assignment (no group /assign step).
 
 ### Cloud PC User Settings
 
@@ -104,34 +106,38 @@ Creates two user setting policies:
 - **`W365_UserSettings`** - Assigned to `[Location]_Windows365_User` group with local admin disabled
 
 **Default Settings:**
-- Restore point enabled with 12-hour frequency
+- Reset enabled; restore point frequency 6 hours
+- DR settings created but disabled by default (configure manually if needed)
 - SSO enabled where available
+- Language fallback: if the chosen language is rejected, the policy is created with en-GB and a warning is shown
+- AI option: if the selected SKU is Copilot-eligible (≥8 vCPU/32GB/256GB), `AI_Enabled_Cloud_PC` is created and assigned to the licensing group
 
 ### Cloud PC Provisioning Policy
 
 Creates a provisioning policy named:
 ```
-[RegionName]-W365-Enterprise-Provisioning Policy
+<RegionName>-W365-<LicenseType>-Provisioning Policy
 ```
 
 **Configuration:**
-- Provisioning type: Dedicated
+- Provisioning type: 
+   - Enterprise: dedicated
+   - Frontline Dedicated: sharedByUser
+   - Frontline Shared: sharedByEntraGroup (with user settings persistence enabled)
 - User experience: Cloud PC (full desktop)
 - Domain join: Entra ID join
-- Image: Selected Windows 11 enterprise image (supported or warning status only)
-- Windows language: Configurable (en-GB default, 20+ languages supported)
-- Assigned to: Location-based user and admin groups
+- Image: Selected Windows 11 enterprise image (supported or supportedWithWarning)
+- Windows language: Configurable (en-GB default, 20+ languages supported; fallback to en-GB on validation failure)
+- Assignments:
+   - Enterprise: assigned to user/admin groups via /assign (merged to preserve existing)
+   - Frontline: no /assign; policy applies when licenses are assigned
 
 ## Key Features
 
 ### Intelligent Assignment Management
 
-The script preserves existing assignments when updating policies. Instead of replacing all assignments (as the Graph API's `/assign` endpoint does), the script:
-
-1. Retrieves existing assignments
-2. Merges new groups with existing assignments
-3. Applies the complete merged list
-4. Prevents accidental removal of user access
+- **Enterprise:** Retrieves existing assignments, merges, and applies to avoid overwriting.
+- **Frontline:** Skips `/assign`; policies apply automatically when Frontline licenses are assigned.
 
 ### Automatic Module Installation
 
@@ -158,12 +164,10 @@ The script displays:
 
 ### Important Reminder
 
-After successful script execution, remember to assign Windows 365 licenses:
-```
-License Assignment Required
-- GRP_Users_[CloudPCType]
-- GRP_Admins_[CloudPCType]
-```
+After successful script execution, remember to assign Windows 365 licenses to:
+
+- `SG-W365CloudPC-<Cloud PC Type>` (licensing group)
+- Frontline: ensure users receive Frontline licenses; the provisioning policy applies via license
 
 ## Troubleshooting
 
