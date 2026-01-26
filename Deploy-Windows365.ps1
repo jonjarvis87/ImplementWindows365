@@ -5,7 +5,7 @@
     Prompts for a Cloud PC SKU, then:
     - Ensures Microsoft.Graph is installed
     - Connects to Microsoft Graph (Beta)
-    - Creates (or reuses) two Azure AD security groups
+    - Creates (or reuses) two Entra ID security groups
     - Creates (or reuses) Cloud PC User Settings policies + assigns them
     - Creates (or reuses) a Cloud PC Provisioning Policy + assigns it
     - Preserves existing assignments by merging current + new groups (Graph /assign is replace-all)
@@ -101,6 +101,40 @@ function Get-AllGraphItems {
     }
 
     return $items
+}
+
+function Get-SkuMetrics {
+    param(
+        [Parameter(Mandatory)] [string]$DisplayName
+    )
+
+    # Parse values like "8vCPU/32GB/256GB" or "16vCPU/64GB/1TB" from the plan display name
+    if ($DisplayName -match '(?<vcpu>\d+)vCPU/(?<ram>\d+)GB/(?<storage>[\d\.]+)(?<unit>TB|GB)') {
+        $vcpu    = [int]$Matches['vcpu']
+        $ramGb   = [int]$Matches['ram']
+        $storage = [double]$Matches['storage']
+        $unit    = $Matches['unit']
+        $storageGb = if ($unit -eq 'TB') { $storage * 1024 } else { $storage }
+
+        return [pscustomobject]@{
+            Vcpu      = $vcpu
+            RamGb     = $ramGb
+            StorageGb = [int][math]::Round($storageGb,0)
+        }
+    }
+
+    return $null
+}
+
+function Test-IsCopilotEligibleSku {
+    param(
+        [Parameter(Mandatory)] [string]$DisplayName
+    )
+
+    $metrics = Get-SkuMetrics -DisplayName $DisplayName
+    if (-not $metrics) { return $false }
+
+    return ($metrics.Vcpu -ge 8 -and $metrics.RamGb -ge 32 -and $metrics.StorageGb -ge 256)
 }
 
 function Get-OrCreateGroup {
@@ -205,11 +239,22 @@ function Get-OrCreateCloudPcUserSetting {
             Write-Host "Creating Cloud PC User Setting: $DisplayName" -ForegroundColor Yellow
 
             $params = @{
-                DisplayName       = $DisplayName
-                LocalAdminEnabled = $LocalAdminEnabled
-                RestorePointSetting = @{
-                    UserRestoreEnabled = $true
-                    FrequencyInHours   = 12
+                displayName       = $DisplayName
+                localAdminEnabled = $LocalAdminEnabled
+                resetEnabled      = $true
+                restorePointSetting = @{
+                    userRestoreEnabled = $true
+                    frequencyInHours   = 6
+                }
+                crossRegionDisasterRecoverySetting = @{
+                    crossRegionDisasterRecoveryEnabled         = $false
+                    maintainCrossRegionRestorePointEnabled     = $true
+                    disasterRecoveryNetworkSetting             = $null
+                    disasterRecoveryType                       = "notConfigured"
+                    userInitiatedDisasterRecoveryAllowed       = $false
+                }
+                notificationSetting = @{
+                    restartPromptsDisabled = $false
                 }
             }
 
@@ -423,18 +468,56 @@ function Get-OrCreateProvisioningPolicy {
                     $existing = New-MgBetaDeviceManagementVirtualEndpointProvisioningPolicy -BodyParameter $params -ErrorAction Stop
                 }
                 catch {
-                    Write-Verbose "Failed to create with cmdlet, trying direct Graph API..."
+                    Write-Verbose "Failed to create with cmdlet, trying direct Graph API... Error: $($_.Exception.Message)"
                     Write-Verbose "Provisioning payload: $($params | ConvertTo-Json -Depth 6)"
-                    $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-                    $existing = $createResponse
+
+                    $attemptedFallback = $false
+                    $languageFallbackUsed = $false
+                    try {
+                        $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                        $existing = $createResponse
+                    }
+                    catch {
+                        if (-not $attemptedFallback -and $params.windowsSettings.language -ne "en-GB") {
+                            Write-Warning "Provisioning policy creation failed (language validation). Retrying with en-GB."
+                            $params.windowsSettings.language = "en-GB"
+                            $attemptedFallback = $true
+                            $languageFallbackUsed = $true
+                            $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                            $existing = $createResponse
+                        }
+                        else {
+                            throw
+                        }
+                    }
                 }
             }
             else {
                 Write-Verbose "Provisioning payload: $($params | ConvertTo-Json -Depth 6)"
-                $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-                $existing = $createResponse
+                $attemptedFallback = $false
+                $languageFallbackUsed = $false
+                try {
+                    $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                    $existing = $createResponse
+                }
+                catch {
+                    if (-not $attemptedFallback -and $params.windowsSettings.language -ne "en-GB") {
+                        Write-Warning "Provisioning policy creation failed (language validation). Retrying with en-GB."
+                        $params.windowsSettings.language = "en-GB"
+                        $attemptedFallback = $true
+                        $languageFallbackUsed = $true
+                        $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                        $existing = $createResponse
+                    }
+                    else {
+                        throw
+                    }
+                }
             }
             
+            if ($languageFallbackUsed) {
+                Write-Host "Provisioning policy was created using language fallback (en-GB). Please update the language manually in the Microsoft Intune admin center if required." -ForegroundColor Red
+            }
             Write-Verbose "Provisioning policy created: $DisplayName with ID: $($existing.id)"
         }
         else {
@@ -668,6 +751,7 @@ else {
 }
 
 $Windows365CloudPCType = $CloudPCType[$Windows365CloudPCTypeVariable - 1]
+$IsCopilotEligible = Test-IsCopilotEligibleSku -DisplayName $Windows365CloudPCType
 
 # Get supported region groups for Cloud PC
 Write-Host "`nRetrieving supported Windows 365 region groups..." -ForegroundColor Cyan
@@ -968,13 +1052,23 @@ else {
     }
 }
 
-# Groups - per Cloud PC Type
-$UserGroupName  = "GRP_Users_$Windows365CloudPCType"
-$AdminGroupName = "GRP_Admins_$Windows365CloudPCType"
+# Calculate friendly region name for use in group names
+$policyRegionNameRaw  = if ($SelectedRegionDisplayName) { $SelectedRegionDisplayName } else { $SelectedRegionName -replace '[_-]', ' ' -replace '(?<=.)([A-Z])',' $1' }
+$policyRegionName     = (Get-Culture).TextInfo.ToTitleCase($policyRegionNameRaw.ToLower().Trim())
+
+# Groups - Create licensing group and location-based groups
+# Licensing group (merges all users and admins for license assignment) - based on Cloud PC type
+$LicensingGroupName = "Windows365_${Windows365CloudPCType}"
+
+# Location-based groups for user/admin settings
+$LocationName = $policyRegionName  # Use friendly region name
+$UserGroupName  = "${LocationName}_Windows365_User"
+$AdminGroupName = "${LocationName}_Windows365_LocalAdmin"
 
 Write-Verbose "Creating/retrieving groups..."
-$GroupIDUser  = Get-OrCreateGroup -DisplayName $UserGroupName  -Description "Contains $Windows365CloudPCType Users"
-$GroupIDAdmin = Get-OrCreateGroup -DisplayName $AdminGroupName -Description "Contains $Windows365CloudPCType Admins"
+$GroupIDLicensing = Get-OrCreateGroup -DisplayName $LicensingGroupName -Description "All Windows 365 users and admins for license assignment"
+$GroupIDUser      = Get-OrCreateGroup -DisplayName $UserGroupName  -Description "Windows 365 users in $LocationName"
+$GroupIDAdmin     = Get-OrCreateGroup -DisplayName $AdminGroupName -Description "Windows 365 local admins in $LocationName"
 
 # Allow time for group replication before policy assignment (prov policy /assign is more eventual)
 Write-Verbose "Waiting for group replication to complete..."
@@ -985,20 +1079,26 @@ Write-Verbose "Creating/retrieving Cloud PC User Settings..."
 $cloudPcAdminSettingId = Get-OrCreateCloudPcUserSetting -DisplayName "W365_AdminSettings" -LocalAdminEnabled $true  -TargetGroupId $GroupIDAdmin
 $cloudPcUserSettingId  = Get-OrCreateCloudPcUserSetting -DisplayName "W365_UserSettings"  -LocalAdminEnabled $false -TargetGroupId $GroupIDUser
 
+if ($IsCopilotEligible) {
+    Write-Host "`n⚠️ AI Enabled Cloud PC detected: creating AI_Enabled_Cloud_PC user setting and assigning $LicensingGroupName." -ForegroundColor Green
+    $aiUserSettingId = Get-OrCreateCloudPcUserSetting -DisplayName "AI_Enabled_Cloud_PC" -LocalAdminEnabled $false -TargetGroupId $GroupIDLicensing
+}
+
+Write-Host "`n⚠️  Note: Cross-Region Disaster Recovery (DR) settings have been created with defaults disabled." -ForegroundColor Yellow
+Write-Host "If you need to configure DR for your Cloud PCs, please manually update the settings in the Microsoft Intune admin center." -ForegroundColor Yellow
+
 # Provisioning Policy - per Region
 Write-Verbose "Creating/retrieving Provisioning Policy for region..."
-
-# Human-friendly region name only (skip group prefix to avoid awkward strings)
-$policyRegionNameRaw  = if ($SelectedRegionDisplayName) { $SelectedRegionDisplayName } else { $SelectedRegionName -replace '[_-]', ' ' -replace '(?<=.)([A-Z])',' $1' }
-$policyRegionName     = (Get-Culture).TextInfo.ToTitleCase($policyRegionNameRaw.ToLower().Trim())
 
 $ProvisioningPolicyName = "$policyRegionName-W365-Enterprise-Provisioning Policy"
 $cloudPcProvisioningPolicyId = Get-OrCreateProvisioningPolicy -DisplayName $ProvisioningPolicyName -AssignGroupIds @($GroupIDAdmin, $GroupIDUser) -RegionGroup $SelectedRegionGroup -CountryRegion $SelectedCountryRegion -ImageId $SelectedImage.Id -ImageDisplayName $SelectedImage.DisplayName -Language $SelectedLanguage
 
 Write-Host "`nDone ✅" -ForegroundColor Green
-Write-Host "Remember to assign the correct Windows 365 license to the groups created:" -ForegroundColor Yellow
-Write-Host " - $UserGroupName" -ForegroundColor Yellow
-Write-Host " - $AdminGroupName" -ForegroundColor Yellow
+Write-Host "Remember to assign the correct Windows 365 license to the licensing group:" -ForegroundColor Yellow
+Write-Host " - $LicensingGroupName" -ForegroundColor Yellow
+Write-Host "`nLocation-based user and admin groups have been assigned to settings policies:" -ForegroundColor Yellow
+Write-Host " - $UserGroupName (assigned to user settings)" -ForegroundColor Yellow
+Write-Host " - $AdminGroupName (assigned to admin settings)" -ForegroundColor Yellow
 
 # Cleanup
 Write-Verbose "Disconnecting from Microsoft Graph..."

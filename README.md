@@ -1,12 +1,12 @@
 # ImplementWindows365
 
-A comprehensive PowerShell script to deploy and configure Windows 365 Cloud PC environments in Microsoft Azure, including Azure AD security groups, user settings policies, and provisioning policies.
+A comprehensive PowerShell script to deploy and configure Windows 365 Cloud PC environments in Microsoft Azure, including Entra ID security groups, user settings policies, and provisioning policies.
 
 ## Overview
 
 `Deploy-Windows365.ps1` automates the complete setup of Windows 365 Cloud PC infrastructure. It handles:
 
-- Azure AD security group creation/reuse for user and admin roles
+- Entra ID security group creation/reuse for user and admin roles
 - Cloud PC user settings policies with local admin configuration
 - Cloud PC provisioning policies with regional deployment
 - Intelligent assignment preservation to avoid overwriting existing configurations
@@ -15,11 +15,11 @@ A comprehensive PowerShell script to deploy and configure Windows 365 Cloud PC e
 
 ### Required Permissions
 
-Your Microsoft Entra ID (Azure AD) account must have the following Microsoft Graph API scopes:
+Your Microsoft Entra ID account must have the following Microsoft Graph API scopes:
 - `User.ReadWrite.All` - For user management
 - `Application.ReadWrite.All` - For application management
 - `CloudPC.ReadWrite.All` - For Windows 365 Cloud PC management
-- `Group.ReadWrite.All` - For Azure AD group management
+- `Group.ReadWrite.All` - For Entra ID group management
 
 ### Required Software
 
@@ -78,21 +78,30 @@ The script will prompt you to:
 
 ## What the Script Creates
 
-### Azure AD Security Groups
+### Entra ID Security Groups
 
-The script creates two security groups per Cloud PC type:
+The script creates three security groups:
 
-- **`GRP_Users_[CloudPCType]`** - Users who need standard Cloud PC access (no local admin)
-- **`GRP_Admins_[CloudPCType]`** - Admin users with local administrator rights on Cloud PCs
+1. **`Windows365_Cloud_PC_Type`** - Merged group for all users and admins
+   - Used for assigning Windows 365 licenses
+   - Contains both standard users and administrators
 
-**Note:** You must assign the appropriate Windows 365 licenses to these groups after creation.
+2. **`[Location]_Windows365_User`** - Location-specific user group
+   - Standard users for the specified region (e.g., `London_Windows365_User`)
+   - Assigned to the user settings policy (no local admin rights)
+
+3. **`[Location]_Windows365_LocalAdmin`** - Location-specific admin group
+   - Administrator users for the specified region (e.g., `London_Windows365_LocalAdmin`)
+   - Assigned to the admin settings policy (with local admin rights)
+
+**Important:** You must assign the Windows 365 license to the `Windows365_Cloud_PC_Type` group after creation.
 
 ### Cloud PC User Settings
 
 Creates two user setting policies:
 
-- **`W365_AdminSettings`** - Assigned to admin group with local admin enabled
-- **`W365_UserSettings`** - Assigned to user group with local admin disabled
+- **`W365_AdminSettings`** - Assigned to `[Location]_Windows365_LocalAdmin` group with local admin enabled
+- **`W365_UserSettings`** - Assigned to `[Location]_Windows365_User` group with local admin disabled
 
 **Default Settings:**
 - Restore point enabled with 12-hour frequency
@@ -108,10 +117,10 @@ Creates a provisioning policy named:
 **Configuration:**
 - Provisioning type: Dedicated
 - User experience: Cloud PC (full desktop)
-- Domain join: Azure AD join
+- Domain join: Entra ID join
 - Image: Selected Windows 11 enterprise image (supported or warning status only)
 - Windows language: Configurable (en-GB default, 20+ languages supported)
-- Assigned to: Both user and admin groups
+- Assigned to: Location-based user and admin groups
 
 ## Key Features
 
@@ -137,7 +146,7 @@ If Microsoft Graph modules are not found, the script automatically installs them
 
 ### Group Replication Management
 
-The script includes built-in delays to account for Azure AD group replication latency before assigning policies.
+The script includes built-in delays to account for Entra ID group replication latency before assigning policies.
 
 ## Output
 
@@ -224,7 +233,7 @@ The script is safe to run multiple times:
 |---|---|
 | PowerShell | 5.0+ (7.x recommended) |
 | Microsoft.Graph | Latest stable |
-| Azure AD Role | At minimum: Groups Admin, Cloud PC Admin |
+| Entra ID Role | At minimum: Groups Admin, Cloud PC Admin |
 | Windows 365 License | Required for group assignment |
 | API Scopes | User.ReadWrite.All, Application.ReadWrite.All, CloudPC.ReadWrite.All, Group.ReadWrite.All |
 
@@ -242,7 +251,7 @@ For issues or questions:
 1. Run with `-Verbose` flag for detailed logging
 2. Check Microsoft Graph health dashboard
 3. Verify all prerequisites are met
-4. Review required permissions in Azure AD admin center
+4. Review required permissions in Entra ID admin center
 
 ## Author
 
