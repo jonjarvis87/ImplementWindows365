@@ -24,8 +24,9 @@ Your Microsoft Entra ID account must have the following Microsoft Graph API scop
 ### Required Software
 
 - **PowerShell 5.0+** (tested on PowerShell 7.x)
-- **Microsoft.Graph** module (script will auto-install if missing)
-- **Microsoft.Graph.Beta.DeviceManagement.Administration** module (v2.23.0+, recommended but not required - script has fallback)
+- **Microsoft.Graph.Authentication module** (lightweight, ~2MB; script will auto-install if missing)
+  - Provides `Connect-MgGraph` for authentication and `Invoke-MgGraphRequest` for API calls
+  - This minimal module is a significant improvement over the full `Microsoft.Graph` package (200MB+)
 
 ### Tenant Requirements
 
@@ -57,7 +58,7 @@ The script will prompt you to:
 2. Select a Windows 365 Cloud PC SKU (filtered to Enterprise or Frontline plans based on your choice)
 3. Select a region group (two-step: region group, then specific region)
 4. Select a Windows 11 device image (unsupported images are filtered; warnings are allowed)
-5. Select a language (20 options; falls back to en-GB with a warning if the selection is rejected by Graph)
+5. Select a language via interactive grid (42 languages; falls back to en-GB with a warning if the selection is rejected by Graph)
 
 ### Usage with Parameters
 
@@ -127,25 +128,29 @@ Creates a provisioning policy named:
 - User experience: Cloud PC (full desktop)
 - Domain join: Entra ID join
 - Image: Selected Windows 11 enterprise image (supported or supportedWithWarning)
-- Windows language: Configurable (en-GB default, 20+ languages supported; fallback to en-GB on validation failure)
+- Windows language: Interactive grid selection (42 languages supported alphabetically: Arabic, Bulgarian, Chinese Simplified, Chinese Traditional, Croatian, Czech, Danish, Dutch, English Australia, English Ireland, English New Zealand, English United Kingdom, English United States, Estonian, Finnish, French Canada, French France, German, Greek, Hebrew, Hindi, Hungarian, Italian, Japanese, Korean, Latvian, Lithuanian, Norwegian, Polish, Portuguese Brazil, Portuguese Portugal, Romanian, Russian, Serbian, Slovak, Slovenian, Spanish Mexico, Spanish Spain, Swedish, Thai, Turkish, Ukrainian; en-GB default with fallback on validation failure)
 - Assignments:
    - Enterprise: assigned to user/admin groups via /assign (merged to preserve existing)
    - Frontline: no /assign; policy applies when licenses are assigned
 
 ## Key Features
 
+### Lightweight Module Installation
+
+- Installs only **Microsoft.Graph.Authentication** (~2MB)
+- No need for the full `Microsoft.Graph` package (200MB+)
+- Uses direct REST API calls (already included in the minimal module)
+- Faster installation and reduced disk footprint
+
 ### Intelligent Assignment Management
 
 - **Enterprise:** Retrieves existing assignments, merges, and applies to avoid overwriting.
 - **Frontline:** Skips `/assign`; policies apply automatically when Frontline licenses are assigned.
 
-### Automatic Module Installation
-
-If Microsoft Graph modules are not found, the script automatically installs them with administrator confirmation.
-
 ### Robust Error Handling
 
-- Graceful fallback from PowerShell cmdlets to direct Microsoft Graph API calls
+- All group and policy operations use direct Microsoft Graph API (Invoke-MgGraphRequest)
+- No dependency on heavy Graph cmdlet modules
 - Detailed verbose logging for troubleshooting
 - Pre-validation of group IDs before assignment
 - Safe handling of API response variations

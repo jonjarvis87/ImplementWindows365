@@ -36,34 +36,24 @@ param(
 # ----------------------------
 
 function Install-GraphModuleIfNeeded {
-    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
-        Write-Host "Microsoft.Graph module not found. Installing..." -ForegroundColor Yellow
+    # Only install Microsoft.Graph.Authentication (~2MB lightweight module)
+    # This provides Connect-MgGraph and Invoke-MgGraphRequest
+    # All other operations use direct REST API calls (no heavy modules needed)
+    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+        Write-Host "Installing Microsoft.Graph.Authentication (lightweight, ~2MB)..." -ForegroundColor Yellow
         try {
-            Install-Module -Name Microsoft.Graph -AllowClobber -Force -ErrorAction Stop
-            Write-Verbose "Microsoft.Graph module installed successfully"
+            Install-Module -Name Microsoft.Graph.Authentication -AllowClobber -Force -ErrorAction Stop
+            Write-Host "Microsoft.Graph.Authentication module installed successfully" -ForegroundColor Green
         }
         catch {
-            Write-Error "Failed to install Microsoft.Graph module: $_"
+            Write-Error "Failed to install Microsoft.Graph.Authentication module: $_"
             throw
         }
     }
     else {
-        Write-Host "Microsoft.Graph module already installed. Skipping install." -ForegroundColor Green
+        Write-Host "Microsoft.Graph.Authentication module already installed." -ForegroundColor Green
     }
-    # Install required Beta DeviceManagement.Administration module
-    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Beta.DeviceManagement.Administration)) {
-        Write-Host "Microsoft.Graph.Beta.DeviceManagement.Administration module not found. Installing..." -ForegroundColor Yellow
-        try {
-            Install-Module -Name Microsoft.Graph.Beta.DeviceManagement.Administration -MinimumVersion 2.23.0 -AllowClobber -Force -ErrorAction Stop
-            Write-Verbose "Microsoft.Graph.Beta.DeviceManagement.Administration module installed successfully"
-        }
-        catch {
-            Write-Warning "Failed to install Microsoft.Graph.Beta.DeviceManagement.Administration module: $_. Will use REST API fallback."
-        }
-    }
-    else {
-        Write-Host "Microsoft.Graph.Beta.DeviceManagement.Administration module already installed." -ForegroundColor Green
-    }}
+}
 
 function Get-ValidChoice {
     param(
@@ -144,24 +134,9 @@ function Get-OrCreateGroup {
     )
 
     try {
-        $existing = $null
-        
-        # Try Get-MgGroup first, but fall back to direct Graph API if module is not available
-        if (Get-Command Get-MgGroup -ErrorAction SilentlyContinue) {
-            try {
-                $existing = Get-MgGroup -Filter "displayName eq '$DisplayName'" -ConsistencyLevel eventual -CountVariable c -ErrorAction Stop
-            }
-            catch {
-                Write-Verbose "Get-MgGroup failed, falling back to direct Graph API: $_"
-                # Fall through to direct API call
-            }
-        }
-        
-        # Fallback to direct Graph API if cmdlet failed or not available
-        if (-not $existing) {
-            $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
-            $existing = $response.value | Select-Object -First 1
-        }
+        # Use REST API directly (no Graph module cmdlets needed)
+        $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+        $existing = $response.value | Select-Object -First 1
 
         if ($existing) {
             Write-Host "Group already exists: $DisplayName" -ForegroundColor Green
@@ -181,22 +156,9 @@ function Get-OrCreateGroup {
 
         Write-Host "Creating group: $DisplayName" -ForegroundColor Yellow
         
-        # Try New-MgGroup first, then fallback to direct Graph API
-        if (Get-Command New-MgGroup -ErrorAction SilentlyContinue) {
-            try {
-                $new = New-MgGroup -BodyParameter $params -ErrorAction Stop
-                Write-Verbose "Group created successfully with ID: $($new.Id)"
-                return $new.Id
-            }
-            catch {
-                Write-Verbose "New-MgGroup failed, falling back to direct Graph API: $_"
-                # Fall through to direct API call
-            }
-        }
-        
-        # Fallback to direct Graph API for group creation
+        # Use REST API directly (no Graph module cmdlets needed)
         $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-        Write-Verbose "Group created successfully with ID: $($createResponse.id)"
+        Write-Host "Group created successfully with ID: $($createResponse.id)" -ForegroundColor Green
         return $createResponse.id
     }
     catch {
@@ -213,27 +175,10 @@ function Get-OrCreateCloudPcUserSetting {
     )
 
     try {
-        $existing = $null
-        $settingAlreadyExisted = $false
-        
-        # Try cmdlet first, but fall back to direct Graph API if module is not available
-        if (Get-Command Get-MgDeviceManagementVirtualEndpointUserSetting -ErrorAction SilentlyContinue) {
-            try {
-                $existing = Get-MgDeviceManagementVirtualEndpointUserSetting -Filter "displayName eq '$DisplayName'" -ErrorAction Stop
-                if ($existing) { $settingAlreadyExisted = $true }
-            }
-            catch {
-                Write-Verbose "Get-MgDeviceManagementVirtualEndpointUserSetting failed, falling back to direct Graph API: $_"
-                # Fall through to direct API call
-            }
-        }
-        
-        # Fallback to direct Graph API if cmdlet failed or not available
-        if (-not $existing) {
-            $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
-            $existing = $response.value | Select-Object -First 1
-            if ($existing) { $settingAlreadyExisted = $true }
-        }
+        # Use REST API directly (no Graph module cmdlets needed)
+        $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+        $existing = $response.value | Select-Object -First 1
+        $settingAlreadyExisted = $null -ne $existing
 
         if (-not $existing) {
             Write-Host "Creating Cloud PC User Setting: $DisplayName" -ForegroundColor Yellow
@@ -258,22 +203,9 @@ function Get-OrCreateCloudPcUserSetting {
                 }
             }
 
-            # Try New-MgDeviceManagementVirtualEndpointUserSetting first, then fallback
-            if (Get-Command New-MgDeviceManagementVirtualEndpointUserSetting -ErrorAction SilentlyContinue) {
-                try {
-                    $existing = New-MgDeviceManagementVirtualEndpointUserSetting -BodyParameter $params -ErrorAction Stop
-                }
-                catch {
-                    Write-Verbose "New-MgDeviceManagementVirtualEndpointUserSetting failed, falling back to direct Graph API: $_"
-                    # Fall through to direct API call
-                }
-            }
-            
-            # Fallback to direct Graph API for user setting creation
-            if (-not $existing) {
-                $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings" -Body ($params | ConvertTo-Json -Depth 3) -ContentType "application/json" -ErrorAction Stop
-                $existing = $createResponse
-            }
+            # Create user setting via REST API
+            $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings" -Body ($params | ConvertTo-Json -Depth 3) -ContentType "application/json" -ErrorAction Stop
+            $existing = $createResponse
         }
         else {
             Write-Host "Cloud PC User Setting already exists: $DisplayName" -ForegroundColor Green
@@ -1066,39 +998,73 @@ catch {
 
 # Language selection
 $SupportedLanguages = @(
-    @{ DisplayName = "English (United States)"; Code = "en-US" },
-    @{ DisplayName = "English (United Kingdom)"; Code = "en-GB" },
-    @{ DisplayName = "Spanish (Spain)"; Code = "es-ES" },
-    @{ DisplayName = "Spanish (Mexico)"; Code = "es-MX" },
-    @{ DisplayName = "French (France)"; Code = "fr-FR" },
-    @{ DisplayName = "French (Canada)"; Code = "fr-CA" },
-    @{ DisplayName = "German (Germany)"; Code = "de-DE" },
-    @{ DisplayName = "Italian (Italy)"; Code = "it-IT" },
-    @{ DisplayName = "Portuguese (Brazil)"; Code = "pt-BR" },
-    @{ DisplayName = "Portuguese (Portugal)"; Code = "pt-PT" },
-    @{ DisplayName = "Dutch (Netherlands)"; Code = "nl-NL" },
-    @{ DisplayName = "Russian (Russia)"; Code = "ru-RU" },
-    @{ DisplayName = "Japanese (Japan)"; Code = "ja-JP" },
-    @{ DisplayName = "Korean (Korea)"; Code = "ko-KR" },
+    @{ DisplayName = "Arabic (Saudi Arabia)"; Code = "ar-SA" },
+    @{ DisplayName = "Bulgarian (Bulgaria)"; Code = "bg-BG" },
     @{ DisplayName = "Chinese (Simplified)"; Code = "zh-CN" },
     @{ DisplayName = "Chinese (Traditional)"; Code = "zh-TW" },
-    @{ DisplayName = "Arabic (Saudi Arabia)"; Code = "ar-SA" },
+    @{ DisplayName = "Croatian (Croatia)"; Code = "hr-HR" },
+    @{ DisplayName = "Czech (Czech Republic)"; Code = "cs-CZ" },
+    @{ DisplayName = "Danish (Denmark)"; Code = "da-DK" },
+    @{ DisplayName = "Dutch (Netherlands)"; Code = "nl-NL" },
+    @{ DisplayName = "English (Australia)"; Code = "en-AU" },
+    @{ DisplayName = "English (Ireland)"; Code = "en-IE" },
+    @{ DisplayName = "English (New Zealand)"; Code = "en-NZ" },
+    @{ DisplayName = "English (United Kingdom)"; Code = "en-GB" },
+    @{ DisplayName = "English (United States)"; Code = "en-US" },
+    @{ DisplayName = "Estonian (Estonia)"; Code = "et-EE" },
+    @{ DisplayName = "Finnish (Finland)"; Code = "fi-FI" },
+    @{ DisplayName = "French (Canada)"; Code = "fr-CA" },
+    @{ DisplayName = "French (France)"; Code = "fr-FR" },
+    @{ DisplayName = "German (Germany)"; Code = "de-DE" },
+    @{ DisplayName = "Greek (Greece)"; Code = "el-GR" },
+    @{ DisplayName = "Hebrew (Israel)"; Code = "he-IL" },
     @{ DisplayName = "Hindi (India)"; Code = "hi-IN" },
+    @{ DisplayName = "Hungarian (Hungary)"; Code = "hu-HU" },
+    @{ DisplayName = "Italian (Italy)"; Code = "it-IT" },
+    @{ DisplayName = "Japanese (Japan)"; Code = "ja-JP" },
+    @{ DisplayName = "Korean (Korea)"; Code = "ko-KR" },
+    @{ DisplayName = "Latvian (Latvia)"; Code = "lv-LV" },
+    @{ DisplayName = "Lithuanian (Lithuania)"; Code = "lt-LT" },
+    @{ DisplayName = "Norwegian (Bokmål)"; Code = "nb-NO" },
     @{ DisplayName = "Polish (Poland)"; Code = "pl-PL" },
-    @{ DisplayName = "Turkish (Turkey)"; Code = "tr-TR" }
+    @{ DisplayName = "Portuguese (Brazil)"; Code = "pt-BR" },
+    @{ DisplayName = "Portuguese (Portugal)"; Code = "pt-PT" },
+    @{ DisplayName = "Romanian (Romania)"; Code = "ro-RO" },
+    @{ DisplayName = "Russian (Russia)"; Code = "ru-RU" },
+    @{ DisplayName = "Serbian (Latin)"; Code = "sr-Latn-RS" },
+    @{ DisplayName = "Slovak (Slovakia)"; Code = "sk-SK" },
+    @{ DisplayName = "Slovenian (Slovenia)"; Code = "sl-SI" },
+    @{ DisplayName = "Spanish (Mexico)"; Code = "es-MX" },
+    @{ DisplayName = "Spanish (Spain)"; Code = "es-ES" },
+    @{ DisplayName = "Swedish (Sweden)"; Code = "sv-SE" },
+    @{ DisplayName = "Thai (Thailand)"; Code = "th-TH" },
+    @{ DisplayName = "Turkish (Turkey)"; Code = "tr-TR" },
+    @{ DisplayName = "Ukrainian (Ukraine)"; Code = "uk-UA" }
 )
 
 if ([string]::IsNullOrWhiteSpace($Language)) {
-    Write-Host "`nChoose your Windows 11 language by selecting its corresponding number:" -ForegroundColor Green
-    for ($i = 0; $i -lt $SupportedLanguages.Count; $i++) {
-        $selected = if ($SupportedLanguages[$i].Code -eq "en-GB") { " [Default]" } else { "" }
-        Write-Host ("{0,2}. {1}{2}" -f ($i + 1), $SupportedLanguages[$i].DisplayName, $selected)
+    Write-Host "`nSelect your Windows 11 language from the grid below:" -ForegroundColor Green
+    
+    # Add a custom property to display default indicator
+    $languagesForGrid = $SupportedLanguages | ForEach-Object {
+        $default = if ($_.Code -eq "en-GB") { "[Default]" } else { "" }
+        [PSCustomObject]@{
+            "Language" = "$($_.DisplayName) $default"
+            "Code" = $_.Code
+            "DisplayName" = $_.DisplayName
+        }
     }
-    Write-Host ""
-
-    $languageChoice = Get-ValidChoice -Min 1 -Max $SupportedLanguages.Count
-    $SelectedLanguage = $SupportedLanguages[$languageChoice - 1].Code
-    Write-Host "Selected language: $($SupportedLanguages[$languageChoice - 1].DisplayName)" -ForegroundColor Cyan
+    
+    $selectedFromGrid = $languagesForGrid | Out-GridView -Title "Select Windows 11 Language" -OutputMode Single
+    
+    if ($null -eq $selectedFromGrid) {
+        Write-Host "No language selected. Using default (en-GB)" -ForegroundColor Yellow
+        $SelectedLanguage = "en-GB"
+    }
+    else {
+        $SelectedLanguage = $selectedFromGrid.Code
+        Write-Host "Selected language: $($selectedFromGrid.DisplayName)" -ForegroundColor Cyan
+    }
 }
 else {
     # Validate provided language code
