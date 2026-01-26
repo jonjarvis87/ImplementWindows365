@@ -382,7 +382,10 @@ function Get-OrCreateProvisioningPolicy {
         [Parameter(Mandatory)] [string]$CountryRegion,
         [Parameter(Mandatory)] [string]$ImageId,
         [Parameter(Mandatory)] [string]$ImageDisplayName,
-        [Parameter()] [string]$Language = "en-GB"
+        [Parameter()] [string]$Language = "en-GB",
+        [Parameter()] [string]$ProvisioningType = "dedicated",
+        [Parameter()] [bool]$UserSettingsPersistence = $false,
+        [Parameter()] [string]$ServicePlanId = $null
     )
 
     # Validate required parameters
@@ -428,7 +431,7 @@ function Get-OrCreateProvisioningPolicy {
             $params = @{
                 displayName        = $DisplayName
                 description        = ""
-                provisioningType   = "dedicated"
+                provisioningType   = $ProvisioningType
                 userExperienceType = "cloudPc"
                 managedBy          = "windows365"
                 imageId            = $ImageId
@@ -454,9 +457,9 @@ function Get-OrCreateProvisioningPolicy {
                 autopatch = @{
                     autopatchGroupId = $null
                 }
-                userSettingsPersistenceEnabled = $false
+                userSettingsPersistenceEnabled = $UserSettingsPersistence
                 userSettingsPersistenceConfiguration = @{
-                    userSettingsPersistenceEnabled        = $false
+                    userSettingsPersistenceEnabled        = $UserSettingsPersistence
                     userSettingsPersistenceStorageSizeCategory = "sixteenGB"
                 }
                 autopilotConfiguration = $null
@@ -522,6 +525,12 @@ function Get-OrCreateProvisioningPolicy {
         }
         else {
             Write-Host "Provisioning Policy already exists: $DisplayName" -ForegroundColor Green
+        }
+
+        # For Frontline policies, skip group assignment as they are automatically assigned via license
+        if ($ServicePlanId) {
+            Write-Host "Frontline provisioning policy created successfully." -ForegroundColor Green
+            return $existing.id
         }
 
         # Assign via /assign endpoint with pre-validation of group IDs
@@ -596,11 +605,21 @@ function Get-OrCreateProvisioningPolicy {
         }
 
         # Build assignments array with complete list
+        # For Frontline, use servicePlanId instead of groupId
         $assignments = @()
-        foreach ($gid in $allGroupIds) {
+        if ($ServicePlanId) {
+            # Frontline: assign via servicePlanId
             $assignments += @{
                 id     = $null
-                target = @{ groupId = $gid }
+                target = @{ servicePlanId = $ServicePlanId }
+            }
+        } else {
+            # Enterprise: assign via groupId
+            foreach ($gid in $allGroupIds) {
+                $assignments += @{
+                    id     = $null
+                    target = @{ groupId = $gid }
+                }
             }
         }
 
@@ -676,6 +695,31 @@ catch {
     throw
 }
 
+# Choose Windows 365 License Type (Enterprise or Frontline)
+Write-Host "`nChoose your Windows 365 license type:" -ForegroundColor Green
+Write-Host " 1. Enterprise" -ForegroundColor White
+Write-Host " 2. Frontline" -ForegroundColor White
+Write-Host ""
+$licenseTypeChoice = Get-ValidChoice -Min 1 -Max 2
+$LicenseType = if ($licenseTypeChoice -eq 1) { "Enterprise" } else { "Frontline" }
+Write-Host "Selected: Windows 365 $LicenseType" -ForegroundColor Cyan
+
+# For Frontline, choose Dedicated or Shared
+if ($LicenseType -eq "Frontline") {
+    Write-Host "`nChoose your Frontline provisioning type:" -ForegroundColor Green
+    Write-Host " 1. Dedicated (Shared by User)" -ForegroundColor White
+    Write-Host " 2. Shared (Shared by Entra Group)" -ForegroundColor White
+    Write-Host ""
+    $frontlineTypeChoice = Get-ValidChoice -Min 1 -Max 2
+    $FrontlineProvisioningType = if ($frontlineTypeChoice -eq 1) { "sharedByUser" } else { "sharedByEntraGroup" }
+    $FrontlineDisplayType = if ($frontlineTypeChoice -eq 1) { "Dedicated" } else { "Shared" }
+    Write-Host "Selected: Frontline $FrontlineDisplayType" -ForegroundColor Cyan
+}
+else {
+    $FrontlineProvisioningType = "dedicated"  # Enterprise default
+    $FrontlineDisplayType = "Enterprise"
+}
+
 # Get available Cloud PC service plans from Graph
 Write-Host "`nRetrieving available Windows 365 Cloud PC service plans..." -ForegroundColor Cyan
 try {
@@ -700,25 +744,41 @@ try {
         throw "Unable to retrieve Cloud PC service plans"
     }
     
-    # Normalize objects to have DisplayName
+    # Normalize objects to ensure DisplayName and Id properties are accessible
     $servicePlans = $servicePlans | ForEach-Object {
-        if ($_ -is [string]) { [pscustomobject]@{ DisplayName = $_ } }
-        else { $_ }
+        if ($_ -is [string]) { 
+            [pscustomobject]@{ DisplayName = $_; Id = $_ } 
+        }
+        else { 
+            # Extract properties from hashtable or object
+            $displayName = if ($_.displayName) { $_.displayName } elseif ($_.DisplayName) { $_.DisplayName } else { "Unknown" }
+            $id = if ($_.id) { $_.id } elseif ($_.Id) { $_.Id } else { $null }
+            [pscustomobject]@{ DisplayName = $displayName; Id = $id; OriginalObject = $_ }
+        }
     }
 
-    # Filter out Business and Frontline SKUs
-    $servicePlans = $servicePlans | Where-Object { 
-        $_.DisplayName -notmatch 'Business' -and $_.DisplayName -notmatch 'Frontline' 
+    # Filter based on license type selection
+    if ($LicenseType -eq "Enterprise") {
+        # Filter out Business and Frontline SKUs for Enterprise
+        $servicePlans = $servicePlans | Where-Object { 
+            $_.DisplayName -notmatch 'Business' -and $_.DisplayName -notmatch 'Frontline' 
+        }
+    }
+    else {
+        # For Frontline, only show Frontline SKUs
+        $servicePlans = $servicePlans | Where-Object { 
+            $_.DisplayName -match 'Frontline' 
+        }
     }
 
     if (-not $servicePlans -or $servicePlans.Count -eq 0) {
         Write-Warning "No Cloud PC service plans found after filtering. Check available SKUs."
-        throw "No Enterprise Cloud PC service plans available"
+        throw "No $LicenseType Cloud PC service plans available"
     }
 
     # Sort by display name for consistent ordering
     $servicePlans = $servicePlans | Sort-Object DisplayName
-    $CloudPCType = $servicePlans.DisplayName
+    $CloudPCType = $servicePlans
     
     Write-Verbose "Found $($CloudPCType.Count) Cloud PC service plans (Business/Frontline filtered out)"
 }
@@ -731,7 +791,7 @@ catch {
 if (-not $CloudPCTypeChoice) {
     Write-Host "`nChoose your Windows 365 Cloud PC by selecting its corresponding number:" -ForegroundColor Green
     for ($i = 0; $i -lt $CloudPCType.Count; $i++) {
-        Write-Host ("{0,2}. {1}" -f ($i + 1), $CloudPCType[$i])
+        Write-Host ("{0,2}. {1}" -f ($i + 1), $CloudPCType[$i].DisplayName)
     }
     Write-Host ""
     
@@ -742,7 +802,7 @@ else {
         Write-Error "Invalid CloudPCTypeChoice parameter. Must be between 1 and $($CloudPCType.Count)."
         Write-Host "Available plans:" -ForegroundColor Yellow
         for ($i = 0; $i -lt $CloudPCType.Count; $i++) {
-            Write-Host ("{0,2}. {1}" -f ($i + 1), $CloudPCType[$i])
+            Write-Host ("{0,2}. {1}" -f ($i + 1), $CloudPCType[$i].DisplayName)
         }
         throw "CloudPCTypeChoice out of range"
     }
@@ -750,7 +810,8 @@ else {
     Write-Verbose "Using parameter-specified Cloud PC type choice: $CloudPCTypeChoice"
 }
 
-$Windows365CloudPCType = $CloudPCType[$Windows365CloudPCTypeVariable - 1]
+$SelectedServicePlan = $CloudPCType[$Windows365CloudPCTypeVariable - 1]
+$Windows365CloudPCType = $SelectedServicePlan.DisplayName
 $IsCopilotEligible = Test-IsCopilotEligibleSku -DisplayName $Windows365CloudPCType
 
 # Get supported region groups for Cloud PC
@@ -1055,15 +1116,16 @@ else {
 # Calculate friendly region name for use in group names
 $policyRegionNameRaw  = if ($SelectedRegionDisplayName) { $SelectedRegionDisplayName } else { $SelectedRegionName -replace '[_-]', ' ' -replace '(?<=.)([A-Z])',' $1' }
 $policyRegionName     = (Get-Culture).TextInfo.ToTitleCase($policyRegionNameRaw.ToLower().Trim())
+$regionLabel          = (Get-Culture).TextInfo.ToTitleCase(($SelectedRegionName -replace '[_-]', ' ').ToLower().Trim())
 
-# Groups - Create licensing group and location-based groups
+# Groups - Create licensing group and location-based groups with new naming convention
 # Licensing group (merges all users and admins for license assignment) - based on Cloud PC type
-$LicensingGroupName = "Windows365_${Windows365CloudPCType}"
+$LicensingGroupName = "SG-W365CloudPC_${Windows365CloudPCType}"
 
 # Location-based groups for user/admin settings
-$LocationName = $policyRegionName  # Use friendly region name
-$UserGroupName  = "${LocationName}_Windows365_User"
-$AdminGroupName = "${LocationName}_Windows365_LocalAdmin"
+$groupBase = if ($LicenseType -eq "Frontline") { "SG-W365FL" } else { "SG-W365ENT" }
+$UserGroupName  = "${groupBase}-${regionLabel}-User"
+$AdminGroupName = "${groupBase}-${regionLabel}-Admin"
 
 Write-Verbose "Creating/retrieving groups..."
 $GroupIDLicensing = Get-OrCreateGroup -DisplayName $LicensingGroupName -Description "All Windows 365 users and admins for license assignment"
@@ -1084,21 +1146,47 @@ if ($IsCopilotEligible) {
     $aiUserSettingId = Get-OrCreateCloudPcUserSetting -DisplayName "AI_Enabled_Cloud_PC" -LocalAdminEnabled $false -TargetGroupId $GroupIDLicensing
 }
 
-Write-Host "`n⚠️  Note: Cross-Region Disaster Recovery (DR) settings have been created with defaults disabled." -ForegroundColor Yellow
-Write-Host "If you need to configure DR for your Cloud PCs, please manually update the settings in the Microsoft Intune admin center." -ForegroundColor Yellow
-
 # Provisioning Policy - per Region
 Write-Verbose "Creating/retrieving Provisioning Policy for region..."
 
-$ProvisioningPolicyName = "$policyRegionName-W365-Enterprise-Provisioning Policy"
-$cloudPcProvisioningPolicyId = Get-OrCreateProvisioningPolicy -DisplayName $ProvisioningPolicyName -AssignGroupIds @($GroupIDAdmin, $GroupIDUser) -RegionGroup $SelectedRegionGroup -CountryRegion $SelectedCountryRegion -ImageId $SelectedImage.Id -ImageDisplayName $SelectedImage.DisplayName -Language $SelectedLanguage
+# Set provisioning type and user settings persistence based on license type
+$provType = $FrontlineProvisioningType
+$userPersistence = if ($LicenseType -eq "Frontline" -and $FrontlineProvisioningType -eq "sharedByEntraGroup") { $true } else { $false }
+$servicePlanId = if ($LicenseType -eq "Frontline") { $SelectedServicePlan.Id } else { $null }
+
+$ProvisioningPolicyName = "$policyRegionName-W365-$LicenseType-Provisioning Policy"
+$cloudPcProvisioningPolicyId = Get-OrCreateProvisioningPolicy -DisplayName $ProvisioningPolicyName -AssignGroupIds @($GroupIDAdmin, $GroupIDUser) -RegionGroup $SelectedRegionGroup -CountryRegion $SelectedCountryRegion -ImageId $SelectedImage.Id -ImageDisplayName $SelectedImage.DisplayName -Language $SelectedLanguage -ProvisioningType $provType -UserSettingsPersistence $userPersistence -ServicePlanId $servicePlanId
 
 Write-Host "`nDone ✅" -ForegroundColor Green
-Write-Host "Remember to assign the correct Windows 365 license to the licensing group:" -ForegroundColor Yellow
-Write-Host " - $LicensingGroupName" -ForegroundColor Yellow
-Write-Host "`nLocation-based user and admin groups have been assigned to settings policies:" -ForegroundColor Yellow
-Write-Host " - $UserGroupName (assigned to user settings)" -ForegroundColor Yellow
-Write-Host " - $AdminGroupName (assigned to admin settings)" -ForegroundColor Yellow
+
+# Display consolidated manual steps
+Write-Host "`n$('=' * 80)" -ForegroundColor Cyan
+Write-Host "PLEASE NOTE - Manual Steps Required" -ForegroundColor Cyan
+Write-Host "$('=' * 80)" -ForegroundColor Cyan
+
+Write-Host "`n1. License Assignment:" -ForegroundColor Yellow
+Write-Host "   Assign the correct Windows 365 license to the licensing group:" -ForegroundColor White
+Write-Host "   → $LicensingGroupName" -ForegroundColor Green
+
+if ($LicenseType -eq "Frontline") {
+    Write-Host "`n2. Frontline Policy Assignment:" -ForegroundColor Yellow
+    Write-Host "   ⚠️  Frontline provisioning policies require manual assignment after licenses are purchased." -ForegroundColor White
+    Write-Host "   Once users receive Windows 365 Frontline licenses, the provisioning policy will" -ForegroundColor White
+    Write-Host "   automatically apply based on the service plan selected." -ForegroundColor White
+    Write-Host "   → Policy: $ProvisioningPolicyName" -ForegroundColor Green
+}
+
+Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '3' } else { '2' } ). User and Admin Group Assignments:" -ForegroundColor Yellow
+Write-Host "   The following location-based groups have been assigned to settings policies:" -ForegroundColor White
+Write-Host "   → $UserGroupName (user settings)" -ForegroundColor Green
+Write-Host "   → $AdminGroupName (admin settings)" -ForegroundColor Green
+
+Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '4' } else { '3' } ). Cross-Region Disaster Recovery (Optional):" -ForegroundColor Yellow
+Write-Host "   DR settings have been created with defaults disabled." -ForegroundColor White
+Write-Host "   If you need to configure DR for your Cloud PCs, manually update the settings" -ForegroundColor White
+Write-Host "   in the Microsoft Intune admin center under Devices > Cloud PCs > User settings." -ForegroundColor White
+
+Write-Host "`n$('=' * 80)" -ForegroundColor Cyan
 
 # Cleanup
 Write-Verbose "Disconnecting from Microsoft Graph..."
