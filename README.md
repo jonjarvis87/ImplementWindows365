@@ -70,6 +70,19 @@ The script will prompt you to:
 - `-CloudPCTypeChoice` (int): SKU selection (1-based index from available plans)
 - `-RegionChoice` (int): Region selection (1-based index from available regions)
    - Note: Region selection remains interactive (two-step prompt) when not provided
+- `-GroupPrefix` (string): Customize security group prefix (default: `SG-W365`)
+- `-ProvisioningPolicySuffix` (string): Customize provisioning policy suffix (default: `Provisioning Policy`)
+- `-Language` (string): Windows 11 language code (default: `en-GB`)
+
+### Combined Customization Example
+
+```powershell
+.\Deploy-Windows365.ps1 -GroupPrefix "ACME-W365" -ProvisioningPolicySuffix "Config"
+```
+
+This creates groups and policies like:
+- Group: `ACME-W365ENT-EastAsia-User`
+- Policy: `EastAsia-W365-Enterprise-Config`
 
 ### With Verbose Output
 
@@ -77,27 +90,89 @@ The script will prompt you to:
 .\Deploy-Windows365.ps1 -Verbose
 ```
 
+### Custom Group Naming
+
+By default, the script uses `SG-W365` as the group prefix. To customize for your organization's naming standards:
+
+```powershell
+.\Deploy-Windows365.ps1 -GroupPrefix "ACME-W365"
+```
+
+This will create groups like:
+- `ACME-W365CloudPC_<Type>`
+- `ACME-W365ENT-<Region>-User`
+
+## Group Naming Convention
+
+### Default Best Practice
+
+The script uses a standardized naming pattern based on Windows 365 and industry best practices:
+
+```
+<Prefix>-<LicenseType>-<Region>-<Role>
+```
+
+**Example:** `SG-W365ENT-EastAsia-User`
+
+**Components:**
+- **Prefix** (`SG-W365`): Easy to filter/search; indicates type and product
+- **LicenseType** (`ENT` or `FL`): Enterprise or Frontline license
+- **Region** (`EastAsia`, `UKSouth`, etc.): Geographic deployment
+- **Role** (`User` or `Admin`): Permission level
+
+### Why This Convention?
+
+✅ **Searchable** - Filter groups by product, license type, or region  
+✅ **Descriptive** - Clear ownership and purpose at a glance  
+✅ **Scalable** - Works well with multiple regions and deployments  
+✅ **Organized** - Groups naturally sort alphabetically by function  
+✅ **Compliant** - Aligns with Microsoft and industry standards  
+
+### Customizing Naming
+
+If your organization has different naming standards, the script is flexible:
+
+```powershell
+# Use organizational prefix
+.\Deploy-Windows365.ps1 -GroupPrefix "IT-CloudPC"
+
+# Results in:
+# IT-CloudPC-ENT-EastAsia-User
+# IT-CloudPC-FL-EastAsia-Admin
+# IT-CloudPCCloudPC_<Type>
+```
+
+**Naming Guidelines:**
+- Use descriptive prefixes (avoid single letters)
+- Include product identifier (W365, CloudPC, etc.)
+- Distinguish by role (User/Admin) and scope (Region/License)
+- Keep group names under 64 characters for Azure compatibility
+- Avoid spaces and special characters (use hyphens as separators)
+
 ## What the Script Creates
 
 ### Entra ID Security Groups
 
-The script creates/reuses three security groups with standardized names:
+The script creates/reuses three security groups with customizable names:
 
 1. **Licensing (all users/admins for SKU)**
-   - `SG-W365CloudPC-<Cloud PC Type>`
+   - Default: `SG-W365CloudPC_<Cloud PC Type>`
+   - Custom: `<GroupPrefix>CloudPC_<Cloud PC Type>`
    - Assign Windows 365 licenses to this group (required)
 
 2. **User settings group (per region)**
-   - Enterprise: `SG-W365ENT-<Region>-User`
-   - Frontline: `SG-W365FL-<Region>-User`
+   - Enterprise default: `SG-W365ENT-<Region>-User`
+   - Frontline default: `SG-W365FL-<Region>-User`
+   - Custom: `<GroupPrefix>-ENT/FL-<Region>-User`
    - Assigned to the standard user settings (no local admin rights)
 
 3. **Admin settings group (per region)**
-   - Enterprise: `SG-W365ENT-<Region>-Admin`
-   - Frontline: `SG-W365FL-<Region>-Admin`
+   - Enterprise default: `SG-W365ENT-<Region>-Admin`
+   - Frontline default: `SG-W365FL-<Region>-Admin`
+   - Custom: `<GroupPrefix>-ENT/FL-<Region>-Admin`
    - Assigned to the admin settings (with local admin rights)
 
-**Important:** You must assign the Windows 365 license to `SG-W365CloudPC-<Cloud PC Type>` after creation. Frontline provisioning policies are applied via license assignment (no group /assign step).
+**Important:** You must assign the Windows 365 license to the licensing group after creation. Frontline provisioning policies are applied via license assignment (no group /assign step).
 
 ### Cloud PC User Settings
 
@@ -115,9 +190,18 @@ Creates two user setting policies:
 
 ### Cloud PC Provisioning Policy
 
-Creates a provisioning policy named:
+The script creates a provisioning policy with customizable naming:
+
 ```
-<RegionName>-W365-<LicenseType>-Provisioning Policy
+<RegionName>-W365-<LicenseType>-<Suffix>
+```
+
+**Default:** `EastAsia-W365-Enterprise-Provisioning Policy`
+
+**Customize the suffix:**
+```powershell
+.\Deploy-Windows365.ps1 -ProvisioningPolicySuffix "Policy"
+# Results in: EastAsia-W365-Enterprise-Policy
 ```
 
 **Configuration:**
@@ -128,7 +212,7 @@ Creates a provisioning policy named:
 - User experience: Cloud PC (full desktop)
 - Domain join: Entra ID join
 - Image: Selected Windows 11 enterprise image (supported or supportedWithWarning)
-- Windows language: Interactive grid selection (42 languages supported alphabetically: Arabic, Bulgarian, Chinese Simplified, Chinese Traditional, Croatian, Czech, Danish, Dutch, English Australia, English Ireland, English New Zealand, English United Kingdom, English United States, Estonian, Finnish, French Canada, French France, German, Greek, Hebrew, Hindi, Hungarian, Italian, Japanese, Korean, Latvian, Lithuanian, Norwegian, Polish, Portuguese Brazil, Portuguese Portugal, Romanian, Russian, Serbian, Slovak, Slovenian, Spanish Mexico, Spanish Spain, Swedish, Thai, Turkish, Ukrainian; en-GB default with fallback on validation failure)
+- Windows language: Interactive grid selection (42 languages supported; en-GB default with fallback on validation failure)
 - Assignments:
    - Enterprise: assigned to user/admin groups via /assign (merged to preserve existing)
    - Frontline: no /assign; policy applies when licenses are assigned

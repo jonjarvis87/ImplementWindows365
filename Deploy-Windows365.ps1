@@ -5,7 +5,7 @@
     Prompts for a Cloud PC SKU, then:
     - Ensures Microsoft.Graph is installed
     - Connects to Microsoft Graph (Beta)
-    - Creates (or reuses) two Entra ID security groups
+    - Creates (or reuses) Entra ID security groups with customizable naming
     - Creates (or reuses) Cloud PC User Settings policies + assigns them
     - Creates (or reuses) a Cloud PC Provisioning Policy + assigns it
     - Preserves existing assignments by merging current + new groups (Graph /assign is replace-all)
@@ -13,10 +13,25 @@
     The Cloud PC SKU choice (dynamic from tenant). If not provided, will prompt interactively.
 .PARAMETER RegionChoice
     The region choice (dynamic from tenant). Regions are always prompted for selection.
+.PARAMETER Language
+    Optional language code for Windows 11 provisioning policy (default: en-GB). If not provided, will prompt via interactive grid.
+.PARAMETER GroupPrefix
+    Customize the security group prefix (default: "SG-W365"). Use organizational naming standards if needed.
+    Examples: "SG-W365", "ACME-W365", "IT-CloudPC"
+.PARAMETER ProvisioningPolicySuffix
+    Customize the provisioning policy suffix (default: "Provisioning Policy"). Use organizational naming standards if needed.
+    Examples: "Provisioning Policy", "Policy", "Config"
+    Final format: <Region>-W365-<LicenseType>-<ProvisioningPolicySuffix>
 .NOTES
     Script name: Deploy-Windows365.ps1
     Author:      Jon Jarvis
     Required scopes: User.ReadWrite.All, Application.ReadWrite.All, CloudPC.ReadWrite.All, Group.ReadWrite.All
+    Naming Convention Best Practices:
+    - Groups: <GroupPrefix>-<LicenseType>-<Region>-<Role> (e.g., SG-W365ENT-EastAsia-User)
+    - Policies: <Region>-W365-<LicenseType>-<Suffix> (e.g., EastAsia-W365-Enterprise-Provisioning Policy)
+    - Use descriptive prefixes; avoid single letters
+    - Include product identifier; distinguish by role, scope, and type
+    - Keep names under 64 characters for Azure compatibility
 #>
 
 [CmdletBinding()]
@@ -28,7 +43,13 @@ param(
     [int]$RegionChoice,
     
     [Parameter()]
-    [string]$Language = ""
+    [string]$Language = "",
+    
+    [Parameter()]
+    [string]$GroupPrefix = "SG-W365",
+    
+    [Parameter()]
+    [string]$ProvisioningPolicySuffix = "Provisioning Policy"
 )
 
 # ----------------------------
@@ -1084,16 +1105,27 @@ $policyRegionNameRaw  = if ($SelectedRegionDisplayName) { $SelectedRegionDisplay
 $policyRegionName     = (Get-Culture).TextInfo.ToTitleCase($policyRegionNameRaw.ToLower().Trim())
 $regionLabel          = (Get-Culture).TextInfo.ToTitleCase(($SelectedRegionName -replace '[_-]', ' ').ToLower().Trim())
 
-# Groups - Create licensing group and location-based groups with new naming convention
+# Groups - Create licensing group and location-based groups with naming convention
+# Naming convention: <GroupPrefix>-<Type>-<Region>-<Role>
+# Example: SG-W365ENT-EastAsia-User
+# The prefix can be customized via -GroupPrefix parameter; default is "SG-W365"
+# Best Practice Tips:
+# - Use descriptive prefixes (avoid single letters)
+# - Include product identifier (W365, CloudPC, etc.)
+# - Distinguish by role (User/Admin) and scope (Region/License)
+# - Keep under 64 characters for Azure compatibility
+
 # Licensing group (merges all users and admins for license assignment) - based on Cloud PC type
-$LicensingGroupName = "SG-W365CloudPC_${Windows365CloudPCType}"
+$LicensingGroupName = "${GroupPrefix}CloudPC_${Windows365CloudPCType}"
 
 # Location-based groups for user/admin settings
-$groupBase = if ($LicenseType -eq "Frontline") { "SG-W365FL" } else { "SG-W365ENT" }
+$licenseTypeInfix = if ($LicenseType -eq "Frontline") { "FL" } else { "ENT" }
+$groupBase = "${GroupPrefix}-${licenseTypeInfix}"
 $UserGroupName  = "${groupBase}-${regionLabel}-User"
 $AdminGroupName = "${groupBase}-${regionLabel}-Admin"
 
 Write-Verbose "Creating/retrieving groups..."
+Write-Verbose "Using group prefix: $GroupPrefix (customize with -GroupPrefix parameter if needed)"
 $GroupIDLicensing = Get-OrCreateGroup -DisplayName $LicensingGroupName -Description "All Windows 365 users and admins for license assignment"
 $GroupIDUser      = Get-OrCreateGroup -DisplayName $UserGroupName  -Description "Windows 365 users in $LocationName"
 $GroupIDAdmin     = Get-OrCreateGroup -DisplayName $AdminGroupName -Description "Windows 365 local admins in $LocationName"
@@ -1120,7 +1152,11 @@ $provType = $FrontlineProvisioningType
 $userPersistence = if ($LicenseType -eq "Frontline" -and $FrontlineProvisioningType -eq "sharedByEntraGroup") { $true } else { $false }
 $servicePlanId = if ($LicenseType -eq "Frontline") { $SelectedServicePlan.Id } else { $null }
 
-$ProvisioningPolicyName = "$policyRegionName-W365-$LicenseType-Provisioning Policy"
+# Provisioning Policy naming convention: <Region>-W365-<LicenseType>-<Suffix>
+# Example: EastAsia-W365-Enterprise-Provisioning Policy
+# Customize suffix via -ProvisioningPolicySuffix parameter if needed
+$ProvisioningPolicyName = "$policyRegionName-W365-$LicenseType-$ProvisioningPolicySuffix"
+Write-Verbose "Provisioning Policy naming convention: Region-W365-LicenseType-Suffix (customize suffix with -ProvisioningPolicySuffix parameter)"
 $cloudPcProvisioningPolicyId = Get-OrCreateProvisioningPolicy -DisplayName $ProvisioningPolicyName -AssignGroupIds @($GroupIDAdmin, $GroupIDUser) -RegionGroup $SelectedRegionGroup -CountryRegion $SelectedCountryRegion -ImageId $SelectedImage.Id -ImageDisplayName $SelectedImage.DisplayName -Language $SelectedLanguage -ProvisioningType $provType -UserSettingsPersistence $userPersistence -ServicePlanId $servicePlanId
 
 Write-Host "`nDone ✅" -ForegroundColor Green
