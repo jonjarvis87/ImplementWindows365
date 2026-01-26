@@ -209,6 +209,50 @@ After successful script execution, remember to assign Windows 365 licenses to:
 - Try running with `-Verbose` for more details
 - Press `Ctrl+C` to cancel and try again
 
+## Cleanup / Removal
+
+### Destroy-Windows365.ps1
+
+`Destroy-Windows365.ps1` reverses everything created by the deployment script. It removes:
+
+- **Provisioning policies** (named `*-W365-*-Provisioning Policy`)
+- **User settings** (`W365_AdminSettings`, `W365_UserSettings`, `AI_Enabled_Cloud_PC`)
+- **Entra ID groups** (`SG-W365CloudPC-*`, `SG-W365ENT-*`, `SG-W365FL-*`)
+
+The script unassigns all policies and settings before deletion to ensure clean removal.
+
+#### Basic Usage
+
+```powershell
+.\Destroy-Windows365.ps1
+```
+
+#### Selective Removal
+
+Use switches to control what gets removed:
+
+```powershell
+# Only remove groups, keep policies and user settings
+.\Destroy-Windows365.ps1 -RemoveProvisioningPolicies:$false -RemoveUserSettings:$false
+
+# Remove everything except specific items
+.\Destroy-Windows365.ps1 -KeepPolicies "Uksouth-W365-Frontline-Provisioning Policy" -KeepUserSettings "AI_Enabled_Cloud_PC"
+
+# Only remove user settings
+.\Destroy-Windows365.ps1 -RemoveProvisioningPolicies:$false -RemoveGroups:$false
+```
+
+#### Parameters
+
+- `-RemoveProvisioningPolicies` (switch, default: true) - Remove provisioning policies
+- `-RemoveUserSettings` (switch, default: true) - Remove user settings
+- `-RemoveGroups` (switch, default: true) - Remove Entra ID groups
+- `-KeepPolicies` (string[]) - List of policy names to preserve
+- `-KeepUserSettings` (string[]) - List of user settings to preserve
+- `-KeepGroups` (string[]) - List of group names to preserve
+
+⚠️ **Warning:** This is a destructive operation. Ensure you're in the correct tenant before running.
+
 ## Advanced Usage
 
 ### Verbose Logging
@@ -256,11 +300,41 @@ For issues or questions:
 2. Check Microsoft Graph health dashboard
 3. Verify all prerequisites are met
 4. Review required permissions in Entra ID admin center
+5. Reach out to the author via email or LinkedIn (see below)
 
 ## Author
 
-Jon Jarvis
+**Jon Jarvis**
+
+- Email: [jon@jonjarvis.co.uk](mailto:jon@jonjarvis.co.uk)
+- LinkedIn: [linkedin.com/in/jonjarvisuk](https://www.linkedin.com/in/jonjarvisuk/)
 
 ## License
 
-[Add your license information here]
+This project is provided free to the Microsoft community under the MIT License.
+
+### MIT License
+
+Copyright (c) 2026 Jon Jarvis
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+### Community Use
+
+This script is developed and maintained for the benefit of the Microsoft community. It is provided as-is, without warranty, for educational and operational use in Windows 365 environments. Contributions, feedback, and sharing within the community are encouraged.
