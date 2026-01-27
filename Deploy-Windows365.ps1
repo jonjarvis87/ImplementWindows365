@@ -26,6 +26,7 @@
     Script name: Deploy-Windows365.ps1
     Author:      Jon Jarvis
     Required scopes: User.ReadWrite.All, Application.ReadWrite.All, CloudPC.ReadWrite.All, Group.ReadWrite.All
+    Requires:    PowerShell 7.0 or higher
     Naming Convention Best Practices:
     - Groups: <GroupPrefix>-<LicenseType>-<Region>-<Role> (e.g., SG-W365ENT-EastAsia-User)
     - Policies: <Region>-W365-<LicenseType>-<Suffix> (e.g., EastAsia-W365-Enterprise-Provisioning Policy)
@@ -33,6 +34,8 @@
     - Include product identifier; distinguish by role, scope, and type
     - Keep names under 64 characters for Azure compatibility
 #>
+
+#Requires -Version 7.0
 
 [CmdletBinding()]
 param(
@@ -227,7 +230,7 @@ function Get-OrCreateCloudPcUserSetting {
             }
 
             # Create user setting via REST API
-            $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings" -Body ($params | ConvertTo-Json -Depth 3) -ContentType "application/json" -ErrorAction Stop
+            $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings" -Body ($params | ConvertTo-Json -Depth 10) -ContentType "application/json" -ErrorAction Stop
             $existing = $createResponse
         }
         else {
@@ -270,15 +273,15 @@ function Get-OrCreateCloudPcUserSetting {
         return $existing.Id
     }
 
-    # Build complete assignment list: existing + new (avoiding duplicates)
+    # Build complete assignment list: existing + new (avoiding duplicates) – optimized for PS7
     $allGroupIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     
     # Add existing groups
     foreach ($gid in $existingGroupIds) {
-        $allGroupIds.Add($gid) | Out-Null
+        if ($gid) { [void]$allGroupIds.Add($gid) }
     }
     
-    # Add target group if not already present
+    # Add target group and detect if it's new
     $isNew = $allGroupIds.Add($TargetGroupId)
     
     # Build assignments array
@@ -301,24 +304,9 @@ function Get-OrCreateCloudPcUserSetting {
         Write-Host "Group $TargetGroupId already assigned to '$DisplayName', preserving all assignments" -ForegroundColor Green
     }
     
-    # Try Set-MgDeviceManagementVirtualEndpointUserSetting first, then fallback to direct Graph API
-    $assignSuccess = $false
-    if (Get-Command Set-MgDeviceManagementVirtualEndpointUserSetting -ErrorAction SilentlyContinue) {
-        try {
-            Set-MgDeviceManagementVirtualEndpointUserSetting -CloudPcUserSettingId $existing.Id -BodyParameter $assignParams -ErrorAction Stop
-            $assignSuccess = $true
-        }
-        catch {
-            Write-Verbose "Set-MgDeviceManagementVirtualEndpointUserSetting failed, falling back to direct Graph API: $_"
-            # Fall through to direct API call
-        }
-    }
-    
-    if (-not $assignSuccess) {
-        # Direct Graph API fallback using /assign endpoint (POST with assignments array)
-        $uri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings/$($existing.Id)/assign"
-        Invoke-MgGraphRequest -Method POST -Uri $uri -Body ($assignParams | ConvertTo-Json -Depth 5) -ContentType "application/json" -ErrorAction Stop
-    }
+    # Assign via REST API /assign endpoint (PS7-only simplified path)
+    $uri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings/$($existing.Id)/assign"
+    Invoke-MgGraphRequest -Method POST -Uri $uri -Body ($assignParams | ConvertTo-Json -Depth 6) -ContentType "application/json" -ErrorAction Stop
     
     Write-Verbose "User setting assigned successfully with $($assignments.Count) total assignments"
     return $existing.Id
@@ -352,27 +340,15 @@ function Get-OrCreateProvisioningPolicy {
     }
 
     try {
-        # Try to get existing policy - first try cmdlet, then direct API
+        # Retrieve existing policy via REST API (PS7-only)
         $existing = $null
         $policyAlreadyExisted = $false
-        
-        if (Get-Command Get-MgBetaDeviceManagementVirtualEndpointProvisioningPolicy -ErrorAction SilentlyContinue) {
-            try {
-                $existing = Get-MgBetaDeviceManagementVirtualEndpointProvisioningPolicy -Filter "displayName eq '$DisplayName'" -ErrorAction Stop
-            }
-            catch {
-                Write-Verbose "Failed to retrieve with cmdlet, falling back to direct Graph API..."
-            }
+        try {
+            $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+            $existing = $response.value | Select-Object -First 1
         }
-        
-        if (-not $existing) {
-            try {
-                $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
-                $existing = $response.value | Select-Object -First 1
-            }
-            catch {
-                Write-Verbose "Failed to retrieve existing policy via Graph API"
-            }
+        catch {
+            Write-Verbose "Failed to retrieve existing policy via Graph API"
         }
 
         if ($existing) {
@@ -420,56 +396,25 @@ function Get-OrCreateProvisioningPolicy {
                 autopilotConfiguration = $null
             }
 
-            # Try cmdlet first, then direct API
-            if (Get-Command New-MgBetaDeviceManagementVirtualEndpointProvisioningPolicy -ErrorAction SilentlyContinue) {
-                try {
-                    $existing = New-MgBetaDeviceManagementVirtualEndpointProvisioningPolicy -BodyParameter $params -ErrorAction Stop
-                }
-                catch {
-                    Write-Verbose "Failed to create with cmdlet, trying direct Graph API... Error: $($_.Exception.Message)"
-                    Write-Verbose "Provisioning payload: $($params | ConvertTo-Json -Depth 6)"
-
-                    $attemptedFallback = $false
-                    $languageFallbackUsed = $false
-                    try {
-                        $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-                        $existing = $createResponse
-                    }
-                    catch {
-                        if (-not $attemptedFallback -and $params.windowsSettings.language -ne "en-GB") {
-                            Write-Warning "Provisioning policy creation failed (language validation). Retrying with en-GB."
-                            $params.windowsSettings.language = "en-GB"
-                            $attemptedFallback = $true
-                            $languageFallbackUsed = $true
-                            $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-                            $existing = $createResponse
-                        }
-                        else {
-                            throw
-                        }
-                    }
-                }
+            # Create via REST API with language fallback
+            Write-Verbose "Provisioning payload: $($params | ConvertTo-Json -Depth 6)"
+            $attemptedFallback = $false
+            $languageFallbackUsed = $false
+            try {
+                $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                $existing = $createResponse
             }
-            else {
-                Write-Verbose "Provisioning payload: $($params | ConvertTo-Json -Depth 6)"
-                $attemptedFallback = $false
-                $languageFallbackUsed = $false
-                try {
+            catch {
+                if (-not $attemptedFallback -and $params.windowsSettings.language -ne "en-GB") {
+                    Write-Warning "Provisioning policy creation failed (language validation). Retrying with en-GB."
+                    $params.windowsSettings.language = "en-GB"
+                    $attemptedFallback = $true
+                    $languageFallbackUsed = $true
                     $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
                     $existing = $createResponse
                 }
-                catch {
-                    if (-not $attemptedFallback -and $params.windowsSettings.language -ne "en-GB") {
-                        Write-Warning "Provisioning policy creation failed (language validation). Retrying with en-GB."
-                        $params.windowsSettings.language = "en-GB"
-                        $attemptedFallback = $true
-                        $languageFallbackUsed = $true
-                        $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
-                        $existing = $createResponse
-                    }
-                    else {
-                        throw
-                    }
+                else {
+                    throw
                 }
             }
             
@@ -493,24 +438,8 @@ function Get-OrCreateProvisioningPolicy {
         $validGroupIds = @()
         foreach ($gid in $AssignGroupIds | Where-Object { $_ -and (-not [string]::IsNullOrWhiteSpace($_)) }) {
             try {
-                # Try Get-MgGroup first, but fall back to direct Graph API if module is not available
-                $groupFound = $false
-                if (Get-Command Get-MgGroup -ErrorAction SilentlyContinue) {
-                    try {
-                        $g = Get-MgGroup -GroupId $gid -ErrorAction Stop
-                        $validGroupIds += $g.Id
-                        $groupFound = $true
-                    }
-                    catch {
-                        Write-Verbose "Get-MgGroup failed for $gid, trying direct Graph API: $_"
-                    }
-                }
-                
-                # Fallback to direct Graph API
-                if (-not $groupFound) {
-                    $groupResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$gid" -ErrorAction Stop
-                    $validGroupIds += $groupResponse.id
-                }
+                $groupResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$gid" -ErrorAction Stop
+                $validGroupIds += $groupResponse.id
             }
             catch {
                 Write-Warning "Skipping assignment: group ID not found or inaccessible: $gid"
@@ -548,16 +477,10 @@ function Get-OrCreateProvisioningPolicy {
             return $existing.id
         }
 
-        # Build complete assignment list: existing + new (avoiding duplicates)
+        # Build complete assignment list: existing + new (avoiding duplicates) – optimized for PS7
         $allGroupIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        
-        foreach ($gid in $existingGroupIds) {
-            $allGroupIds.Add($gid) | Out-Null
-        }
-        
-        foreach ($gid in $validGroupIds) {
-            $allGroupIds.Add($gid) | Out-Null
-        }
+        foreach ($gid in $existingGroupIds) { if ($gid) { [void]$allGroupIds.Add($gid) } }
+        foreach ($gid in $validGroupIds) { if ($gid) { [void]$allGroupIds.Add($gid) } }
 
         # Build assignments array with complete list
         # For Frontline, use servicePlanId instead of groupId
@@ -579,7 +502,7 @@ function Get-OrCreateProvisioningPolicy {
         }
 
         $assignParams = @{ assignments = $assignments }
-        $assignJson = $assignParams | ConvertTo-Json -Depth 4
+        $assignJson = $assignParams | ConvertTo-Json -Depth 10 -Compress:$false
 
         Write-Host "Assigning Provisioning Policy '$DisplayName' to groups..." -ForegroundColor Cyan
         Write-Verbose "Assign payload: $assignJson"
@@ -650,18 +573,13 @@ Write-Host "`nRetrieving available Windows 365 Cloud PC service plans..." -Foreg
 try {
     $servicePlans = @()
 
-    if (Get-Command Get-MgDeviceManagementVirtualEndpointServicePlan -ErrorAction SilentlyContinue) {
-        try {
-            $servicePlans = Get-MgDeviceManagementVirtualEndpointServicePlan -All -ErrorAction Stop
-        }
-        catch {
-            # Fallback without -All if not supported
-            $servicePlans = Get-MgDeviceManagementVirtualEndpointServicePlan -ErrorAction Stop
-        }
-    }
-    else {
-        # Fallback to direct Graph call (beta) if cmdlet is unavailable, with paging
+    # Use direct Graph REST API call for better reliability
+    try {
         $servicePlans = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/servicePlans"
+    }
+    catch {
+        Write-Error "Failed to retrieve Cloud PC service plans via REST API: $_"
+        throw
     }
     
     if (-not $servicePlans -or $servicePlans.Count -eq 0) {
@@ -744,20 +662,15 @@ Write-Host "`nRetrieving supported Windows 365 region groups..." -ForegroundColo
 try {
     $supportedRegions = @()
 
-    if (Get-Command Get-MgDeviceManagementVirtualEndpointSupportedRegion -ErrorAction SilentlyContinue) {
-        try {
-            $supportedRegions = Get-MgDeviceManagementVirtualEndpointSupportedRegion -All -ErrorAction Stop
-        }
-        catch {
-            # Fallback without -All if not supported
-            $supportedRegions = Get-MgDeviceManagementVirtualEndpointSupportedRegion -ErrorAction Stop
-        }
-    }
-    else {
-        # Fallback to direct Graph call (beta) if cmdlet is unavailable, with paging
+    # Use direct Graph REST API call for better reliability
+    try {
         # Filter for Windows 365 supported regions and select relevant fields
         $uri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/supportedRegions?`$filter=supportedSolution eq 'windows365'&`$select=id,displayName,regionStatus,supportedSolution,regionGroup,cloudDevicePlatformSupported,geographicLocationType"
         $supportedRegions = Get-AllGraphItems -Uri $uri
+    }
+    catch {
+        Write-Error "Failed to retrieve supported regions via REST API: $_"
+        throw
     }
 
     if (-not $supportedRegions -or $supportedRegions.Count -eq 0) {
@@ -775,37 +688,16 @@ try {
     
     Write-Verbose "Filtered to $($supportedRegions.Count) unique regions (removed duplicates)"
 
-    # Normalize objects to ensure RegionGroup, RegionName, and DisplayName are present (use Graph field names when available)
+    # Normalize objects to ensure RegionGroup, RegionName, and DisplayName are present (PS7 null-coalescing)
     $supportedRegions = $supportedRegions | ForEach-Object {
         if ($_ -is [string]) {
-            [pscustomobject]@{
-                RegionGroup = $_
-                RegionName  = $_
-                DisplayName = $_
-            }
+            [pscustomobject]@{ RegionGroup = $_; RegionName = $_; DisplayName = $_ }
         }
         else {
-            # Graph API returns: regionGroup, displayName (no regionName field exists)
-            # Try to get values from properties (lowercase from Graph API, or PascalCase as fallback)
-            $rg = $_.regionGroup
-            if (-not $rg) { $rg = $_.RegionGroup }
-            
-            $dn = $_.displayName
-            if (-not $dn) { $dn = $_.DisplayName }
-            
-            # RegionName should be the same as DisplayName (the actual region like "brazilsouth")
-            # There is no separate regionName field in the Graph API
-            $rn = $dn
-            
-            # Final fallbacks
-            if (-not $rn) { $rn = $rg }
-            if (-not $dn) { $dn = $rg }
-            
-            [pscustomobject]@{
-                RegionGroup = $rg
-                RegionName  = $rn
-                DisplayName = $dn
-            }
+            $rg = ($_.regionGroup) ?? ($_.RegionGroup)
+            $dn = ($_.displayName) ?? ($_.DisplayName)
+            $rn = $dn ?? $rg
+            [pscustomobject]@{ RegionGroup = $rg; RegionName = $rn; DisplayName = $dn }
         }
     }
 
@@ -825,14 +717,17 @@ catch {
 }
 
 if (-not $RegionChoice) {
-    # Step 1: Get unique regionGroup values
+    # Step 1: Get unique regionGroup values from normalized objects
     $uniqueGroups = @()
     foreach ($region in $supportedRegions) {
-        if ($region.RegionGroup -and $region.RegionGroup -notin $uniqueGroups) {
-            $uniqueGroups += $region.RegionGroup
+        $rg = $region.RegionGroup
+        if ($rg -and $rg -notin $uniqueGroups) {
+            $uniqueGroups += $rg
         }
     }
     $uniqueGroups = $uniqueGroups | Sort-Object
+    
+    Write-Verbose "Found $($uniqueGroups.Count) unique region groups: $($uniqueGroups -join ', ')"
 
     Write-Host "`nChoose your Windows 365 region GROUP:" -ForegroundColor Green
     for ($i = 0; $i -lt $uniqueGroups.Count; $i++) {
@@ -848,7 +743,19 @@ if (-not $RegionChoice) {
     $selectedGroupValue = $uniqueGroups[$groupChoice - 1]
 
     # Step 2: Get all displayName values for the selected regionGroup
+    Write-Verbose "Selected region group: '$selectedGroupValue'"
     $regionsInGroup = $supportedRegions | Where-Object { $_.RegionGroup -eq $selectedGroupValue } | Sort-Object DisplayName
+    
+    Write-Verbose "Found $($regionsInGroup.Count) regions in group '$selectedGroupValue'"
+    
+    if (-not $regionsInGroup -or $regionsInGroup.Count -eq 0) {
+        Write-Warning "No regions found for group '$selectedGroupValue'. This may indicate a data consistency issue."
+        Write-Host "`nAvailable regions data:" -ForegroundColor Yellow
+        $supportedRegions | ForEach-Object {
+            Write-Host "  DisplayName: $($_.DisplayName), RegionGroup: '$($_.RegionGroup)'" -ForegroundColor Gray
+        }
+        throw "No regions available for the selected region group"
+    }
     
     Write-Host "`nChoose your Windows 365 REGION:" -ForegroundColor Green
     for ($i = 0; $i -lt $regionsInGroup.Count; $i++) {
@@ -911,24 +818,18 @@ try {
     catch {
         Write-Verbose "Gallery images endpoint failed, trying device images endpoint: $_"
         
-        # Fallback to device images endpoint
-        if (Get-Command Get-MgDeviceManagementVirtualEndpointDeviceImage -ErrorAction SilentlyContinue) {
-            try {
-                $images = Get-MgDeviceManagementVirtualEndpointDeviceImage -All -ErrorAction Stop
-            }
-            catch {
-                # Fallback without -All if not supported
-                $images = Get-MgDeviceManagementVirtualEndpointDeviceImage -ErrorAction Stop
-            }
+        # Fallback to device images endpoint using REST API
+        try {
+            $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/deviceImages"
         }
-        else {
-            # Fallback to direct Graph call (beta) if cmdlet is unavailable, with paging
+        catch {
+            Write-Verbose "Beta endpoint failed, trying v1 endpoint..."
             try {
-                $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/deviceImages"
+                $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/v1.0/deviceManagement/virtualEndpoint/deviceImages"
             }
             catch {
-                Write-Verbose "Beta endpoint failed, trying v1 endpoint..."
-                $images = Get-AllGraphItems -Uri "https://graph.microsoft.com/v1.0/deviceManagement/virtualEndpoint/deviceImages"
+                Write-Error "Failed to retrieve device images: $_"
+                throw
             }
         }
     }

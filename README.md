@@ -16,6 +16,7 @@ A comprehensive PowerShell script to deploy and configure Windows 365 Cloud PC e
 ### Required Permissions
 
 Your Microsoft Entra ID account must have the following Microsoft Graph API scopes:
+
 - `User.ReadWrite.All` - For user management
 - `Application.ReadWrite.All` - For application management
 - `CloudPC.ReadWrite.All` - For Windows 365 Cloud PC management
@@ -23,7 +24,8 @@ Your Microsoft Entra ID account must have the following Microsoft Graph API scop
 
 ### Required Software
 
-- **PowerShell 5.0+** (tested on PowerShell 7.x)
+- **PowerShell 7.0 or higher** (PowerShell 5.x is not supported)
+  - Download: [PowerShell 7](https://aka.ms/powershell)
 - **Microsoft.Graph.Authentication module** (lightweight, ~2MB; script will auto-install if missing)
   - Provides `Connect-MgGraph` for authentication and `Invoke-MgGraphRequest` for API calls
   - This minimal module is a significant improvement over the full `Microsoft.Graph` package (200MB+)
@@ -37,10 +39,45 @@ Your Microsoft Entra ID account must have the following Microsoft Graph API scop
 
 ## Installation
 
+### Installing PowerShell 7 (Windows)
+
+This script requires PowerShell 7.0 or higher. If you don't have it installed on Windows:
+
+**Option 1: Using winget (Windows 10 1709 or later)**
+```powershell
+winget install --id Microsoft.PowerShell --source winget
+```
+
+**Option 2: Using MSI Installer**
+1. Download the latest installer from [PowerShell Releases](https://github.com/PowerShell/PowerShell/releases)
+2. Run the `.msi` file (e.g., `PowerShell-7.4.0-win-x64.msi`)
+3. Follow the installation wizard
+
+**Option 3: Using Windows Package Managers**
+```powershell
+# Install via Chocolatey
+choco install powershell
+
+# Or via Scoop
+scoop install pwsh
+```
+
+#### Verify Installation
+
+After installation, open Windows Terminal or PowerShell and verify:
+```powershell
+pwsh --version
+```
+
+You should see output like: `PowerShell 7.4.0` or higher
+
+### Script Setup
+
 1. Clone or download this repository
-2. Open PowerShell as Administrator
+2. Open PowerShell 7 (launch `pwsh` from your terminal)
 3. Navigate to the script directory
 4. (Optional) Set execution policy if needed:
+
    ```powershell
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
@@ -54,6 +91,7 @@ Your Microsoft Entra ID account must have the following Microsoft Graph API scop
 ```
 
 The script will prompt you to:
+
 1. Choose license type: **Enterprise** or **Frontline** (then Dedicated vs Shared for Frontline)
 2. Select a Windows 365 Cloud PC SKU (filtered to Enterprise or Frontline plans based on your choice)
 3. Select a region group (two-step: region group, then specific region)
@@ -67,9 +105,10 @@ The script will prompt you to:
 ```
 
 **Parameters:**
+
 - `-CloudPCTypeChoice` (int): SKU selection (1-based index from available plans)
 - `-RegionChoice` (int): Region selection (1-based index from available regions)
-   - Note: Region selection remains interactive (two-step prompt) when not provided
+  - Note: Region selection remains interactive (two-step prompt) when not provided
 - `-GroupPrefix` (string): Customize security group prefix (default: `SG-W365`)
 - `-ProvisioningPolicySuffix` (string): Customize provisioning policy suffix (default: `Provisioning Policy`)
 - `-Language` (string): Windows 11 language code (default: `en-GB`)
@@ -81,6 +120,7 @@ The script will prompt you to:
 ```
 
 This creates groups and policies like:
+
 - Group: `ACME-W365ENT-EastAsia-User`
 - Policy: `EastAsia-W365-Enterprise-Config`
 
@@ -99,6 +139,7 @@ By default, the script uses `SG-W365` as the group prefix. To customize for your
 ```
 
 This will create groups like:
+
 - `ACME-W365CloudPC_<Type>`
 - `ACME-W365ENT-<Region>-User`
 
@@ -115,6 +156,7 @@ The script uses a standardized naming pattern based on Windows 365 and industry 
 **Example:** `SG-W365ENT-EastAsia-User`
 
 **Components:**
+
 - **Prefix** (`SG-W365`): Easy to filter/search; indicates type and product
 - **LicenseType** (`ENT` or `FL`): Enterprise or Frontline license
 - **Region** (`EastAsia`, `UKSouth`, etc.): Geographic deployment
@@ -143,6 +185,7 @@ If your organization has different naming standards, the script is flexible:
 ```
 
 **Naming Guidelines:**
+
 - Use descriptive prefixes (avoid single letters)
 - Include product identifier (W365, CloudPC, etc.)
 - Distinguish by role (User/Admin) and scope (Region/License)
@@ -182,6 +225,7 @@ Creates two user setting policies:
 - **`W365_UserSettings`** - Assigned to `[Location]_Windows365_User` group with local admin disabled
 
 **Default Settings:**
+
 - Reset enabled; restore point frequency 6 hours
 - DR settings created but disabled by default (configure manually if needed)
 - SSO enabled where available
@@ -199,23 +243,25 @@ The script creates a provisioning policy with customizable naming:
 **Default:** `EastAsia-W365-Enterprise-Provisioning Policy`
 
 **Customize the suffix:**
+
 ```powershell
 .\Deploy-Windows365.ps1 -ProvisioningPolicySuffix "Policy"
 # Results in: EastAsia-W365-Enterprise-Policy
 ```
 
 **Configuration:**
-- Provisioning type: 
-   - Enterprise: dedicated
-   - Frontline Dedicated: sharedByUser
-   - Frontline Shared: sharedByEntraGroup (with user settings persistence enabled)
+
+- Provisioning type:
+  - Enterprise: dedicated
+  - Frontline Dedicated: sharedByUser
+  - Frontline Shared: sharedByEntraGroup (with user settings persistence enabled)
 - User experience: Cloud PC (full desktop)
 - Domain join: Entra ID join
 - Image: Selected Windows 11 enterprise image (supported or supportedWithWarning)
 - Windows language: Interactive grid selection (42 languages supported; en-GB default with fallback on validation failure)
 - Assignments:
-   - Enterprise: assigned to user/admin groups via /assign (merged to preserve existing)
-   - Frontline: no /assign; policy applies when licenses are assigned
+  - Enterprise: assigned to user/admin groups via /assign (merged to preserve existing)
+  - Frontline: no /assign; policy applies when licenses are assigned
 
 ## Key Features
 
@@ -246,6 +292,7 @@ The script includes built-in delays to account for Entra ID group replication la
 ## Output
 
 The script displays:
+
 - Status messages (creation, reuse, assignment)
 - Selected configuration (Cloud PC type, region, image)
 - Group IDs for reference
@@ -360,6 +407,7 @@ The script automatically falls back to direct Microsoft Graph REST API calls if 
 ### Idempotent Execution
 
 The script is safe to run multiple times:
+
 - If groups exist, they're reused
 - If policies exist, they're reused and assignments are merged
 - No duplicate objects are created
@@ -368,8 +416,8 @@ The script is safe to run multiple times:
 
 | Requirement | Version/Details |
 |---|---|
-| PowerShell | 5.0+ (7.x recommended) |
-| Microsoft.Graph | Latest stable |
+| PowerShell | 7.0 or higher (required) |
+| Microsoft.Graph.Authentication | Latest stable (auto-installed) |
 | Entra ID Role | At minimum: Groups Admin, Cloud PC Admin |
 | Windows 365 License | Required for group assignment |
 | API Scopes | User.ReadWrite.All, Application.ReadWrite.All, CloudPC.ReadWrite.All, Group.ReadWrite.All |
@@ -385,6 +433,7 @@ The script is safe to run multiple times:
 ## Support
 
 For issues or questions:
+
 1. Run with `-Verbose` flag for detailed logging
 2. Check Microsoft Graph health dashboard
 3. Verify all prerequisites are met
