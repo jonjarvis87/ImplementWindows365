@@ -3,8 +3,8 @@
     Create a Windows 365 environment (Groups, User Settings, Provisioning Policy)
 .DESCRIPTION
     Prompts for a Cloud PC SKU, then:
-    - Ensures Microsoft.Graph is installed
-    - Connects to Microsoft Graph (Beta)
+    - Ensures Microsoft.Graph.Authentication is installed (lightweight module)
+    - Connects to Microsoft Graph via REST API
     - Creates (or reuses) Entra ID security groups with customizable naming
     - Creates (or reuses) Cloud PC User Settings policies + assigns them
     - Creates (or reuses) a Cloud PC Provisioning Policy + assigns it
@@ -56,6 +56,29 @@ param(
 # Helpers
 # ----------------------------
 
+function Get-ValidChoice {
+    param(
+        [Parameter(Mandatory)] [int]$Min,
+        [Parameter(Mandatory)] [int]$Max
+    )
+    
+    do {
+        try {
+            $choice = Read-Host "Enter your choice"
+            $choiceInt = [int]$choice
+            if ($choiceInt -ge $Min -and $choiceInt -le $Max) {
+                return $choiceInt
+            }
+            else {
+                Write-Host "Invalid choice. Please enter a number between $Min and $Max." -ForegroundColor Red
+            }
+        }
+        catch {
+            Write-Host "Invalid input. Please enter a valid number." -ForegroundColor Red
+        }
+    } while ($true)
+}
+
 function Install-GraphModuleIfNeeded {
     # Only install Microsoft.Graph.Authentication (~2MB lightweight module)
     # This provides Connect-MgGraph and Invoke-MgGraphRequest
@@ -74,27 +97,6 @@ function Install-GraphModuleIfNeeded {
     else {
         Write-Host "Microsoft.Graph.Authentication module already installed." -ForegroundColor Green
     }
-}
-
-function Get-ValidChoice {
-    param(
-        [int]$Min = 1,
-        [int]$Max
-    )
-
-    $choice = $null
-
-    do {
-        $choiceRaw = Read-Host "Enter a number ($Min-$Max)"
-        $choiceOk = [int]::TryParse($choiceRaw, [ref]$choice)
-
-        if (-not $choiceOk -or $choice -lt $Min -or $choice -gt $Max) {
-            Write-Host "Invalid option. Please enter a number between $Min and $Max." -ForegroundColor Red
-            $choice = $null
-        }
-    } while ($null -eq $choice)
-
-    return $choice
 }
 
 function Get-AllGraphItems {
@@ -605,37 +607,7 @@ function Get-OrCreateProvisioningPolicy {
 
 Install-GraphModuleIfNeeded
 
-# Import required Graph modules
-Write-Verbose "Importing Microsoft Graph modules..."
-try {
-    Import-Module Microsoft.Graph.Beta.DeviceManagement.Administration -ErrorAction Stop
-}
-catch {
-    Write-Verbose "Beta DeviceManagement module not found, trying standard module..."
-    try {
-        Import-Module Microsoft.Graph.DeviceManagement.Administration -ErrorAction Stop
-    }
-    catch {
-        Write-Warning "DeviceManagement.Administration module not available. Using direct Graph API calls only."
-    }
-}
-
-# Note: Do not explicitly import Microsoft.Graph.Groups or Microsoft.Graph.Authentication here
-# as Connect-MgGraph already loads them and causes assembly conflicts
-
-# Use Beta profile when available
-$selectProfileCmd = Get-Command Select-MgProfile -ErrorAction SilentlyContinue
-if ($selectProfileCmd) {
-    try {
-        Select-MgProfile -Name beta -ErrorAction Stop
-    }
-    catch {
-        Write-Warning "Could not select beta profile: $_"
-    }
-}
-else {
-    Write-Verbose "Select-MgProfile not found. Using beta endpoints directly."
-}
+# All Graph operations use REST via Invoke-MgGraphRequest; no extra module imports required
 
 # Connect to Graph
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
@@ -1136,12 +1108,12 @@ Start-Sleep -Seconds 10
 
 # User Settings
 Write-Verbose "Creating/retrieving Cloud PC User Settings..."
-$cloudPcAdminSettingId = Get-OrCreateCloudPcUserSetting -DisplayName "W365_AdminSettings" -LocalAdminEnabled $true  -TargetGroupId $GroupIDAdmin
-$cloudPcUserSettingId  = Get-OrCreateCloudPcUserSetting -DisplayName "W365_UserSettings"  -LocalAdminEnabled $false -TargetGroupId $GroupIDUser
+Get-OrCreateCloudPcUserSetting -DisplayName "W365_AdminSettings" -LocalAdminEnabled $true  -TargetGroupId $GroupIDAdmin
+Get-OrCreateCloudPcUserSetting -DisplayName "W365_UserSettings"  -LocalAdminEnabled $false -TargetGroupId $GroupIDUser
 
 if ($IsCopilotEligible) {
     Write-Host "`n⚠️ AI Enabled Cloud PC detected: creating AI_Enabled_Cloud_PC user setting and assigning $LicensingGroupName." -ForegroundColor Green
-    $aiUserSettingId = Get-OrCreateCloudPcUserSetting -DisplayName "AI_Enabled_Cloud_PC" -LocalAdminEnabled $false -TargetGroupId $GroupIDLicensing
+    Get-OrCreateCloudPcUserSetting -DisplayName "AI_Enabled_Cloud_PC" -LocalAdminEnabled $false -TargetGroupId $GroupIDLicensing | Out-Null
 }
 
 # Provisioning Policy - per Region
