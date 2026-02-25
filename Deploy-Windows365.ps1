@@ -193,6 +193,62 @@ function Get-OrCreateGroup {
     }
 }
 
+function Get-OrCreateDynamicDeviceGroup {
+    param(
+        [Parameter(Mandatory)] [string]$DisplayName,
+        [Parameter(Mandatory)] [string]$Description,
+        [Parameter()] [string]$MembershipRule
+    )
+
+    # Default membership rule for Cloud PCs based on device model
+    # This uses the deviceModel property which is more reliable than display name
+    # Customize the rule based on your needs:
+    # - For device model containing "Cloud PC": (device.deviceModel -contains "Cloud PC")
+    # - For devices starting with "CPC-": (device.displayName -startsWith "CPC-")
+    # - For devices containing "365": (device.displayName -contains "365")
+    # - For device category: (device.deviceCategory -eq "CloudPC")
+    if ([string]::IsNullOrWhiteSpace($MembershipRule)) {
+        $MembershipRule = '(device.deviceModel -contains "Cloud PC")'
+    }
+
+    try {
+        # Check if group already exists
+        $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+        $existing = $response.value | Select-Object -First 1
+
+        if ($existing) {
+            Write-Host "Dynamic device group already exists: $DisplayName" -ForegroundColor Green
+            return $existing.Id
+        }
+
+        # MailNickname must be unique, even for security groups
+        $mailNick = ("grp-" + ([guid]::NewGuid().ToString("N").Substring(0,10)))
+
+        $params = @{
+            displayName              = $DisplayName
+            mailEnabled              = $false
+            mailNickname             = $mailNick
+            securityEnabled          = $true
+            description              = $Description
+            groupTypes               = @("DynamicMembership")
+            membershipRuleProcessingState = "On"
+            membershipRule           = $MembershipRule
+        }
+
+        Write-Host "Creating dynamic device group: $DisplayName" -ForegroundColor Yellow
+        Write-Host "  Membership rule: $MembershipRule" -ForegroundColor Cyan
+        
+        # Create dynamic group via REST API
+        $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+        Write-Host "Dynamic device group created successfully with ID: $($createResponse.id)" -ForegroundColor Green
+        return $createResponse.id
+    }
+    catch {
+        Write-Error "Failed to create or retrieve dynamic device group '$DisplayName': $_"
+        throw
+    }
+}
+
 function Get-OrCreateCloudPcUserSetting {
     param(
         [Parameter(Mandatory)] [string]$DisplayName,
@@ -859,7 +915,7 @@ try {
             $availableImages = $availableImages | Sort-Object DisplayName
         }
 
-        Write-Verbose "Found $($availableImages.Count) available device images"
+        Write-Verbose "Found $($availableImages.Count) avdailable device images"
 
         # Select image
         Write-Host "`nChoose a Windows 11 image by selecting its corresponding number:" -ForegroundColor Green
@@ -991,6 +1047,9 @@ $regionLabel          = (Get-Culture).TextInfo.ToTitleCase(($SelectedRegionName 
 # Licensing group (merges all users and admins for license assignment) - based on Cloud PC type
 $LicensingGroupName = "${GroupPrefix}CloudPC_${Windows365CloudPCType}"
 
+# Create description with service plan info for easy license matching
+$LicensingGroupDescription = "All Windows 365 users and admins for license assignment`nService Plan ID: $($SelectedServicePlan.Id)"
+
 # Location-based groups for user/admin settings
 $licenseTypeInfix = if ($LicenseType -eq "Frontline") { "FL" } else { "ENT" }
 $groupBase = "${GroupPrefix}-${licenseTypeInfix}"
@@ -999,9 +1058,15 @@ $AdminGroupName = "${groupBase}-${regionLabel}-Admin"
 
 Write-Verbose "Creating/retrieving groups..."
 Write-Verbose "Using group prefix: $GroupPrefix (customize with -GroupPrefix parameter if needed)"
-$GroupIDLicensing = Get-OrCreateGroup -DisplayName $LicensingGroupName -Description "All Windows 365 users and admins for license assignment"
+Write-Verbose "Service Plan ID: $($SelectedServicePlan.Id)"
+$GroupIDLicensing = Get-OrCreateGroup -DisplayName $LicensingGroupName -Description $LicensingGroupDescription
 $GroupIDUser      = Get-OrCreateGroup -DisplayName $UserGroupName  -Description "Windows 365 users in $LocationName"
 $GroupIDAdmin     = Get-OrCreateGroup -DisplayName $AdminGroupName -Description "Windows 365 local admins in $LocationName"
+
+# Dynamic device group for Cloud PCs
+$DynamicDeviceGroupName = "${GroupPrefix}CloudPC-Devices"
+$DynamicDeviceGroupDescription = "Dynamic group that automatically includes all Windows 365 Cloud PC devices based on naming convention (CPC-*). Customize the membership rule if your Cloud PCs use a different naming convention."
+$GroupIDCloudPCDevices = Get-OrCreateDynamicDeviceGroup -DisplayName $DynamicDeviceGroupName -Description $DynamicDeviceGroupDescription
 
 # Allow time for group replication before policy assignment (prov policy /assign is more eventual)
 Write-Verbose "Waiting for group replication to complete..."
@@ -1056,7 +1121,18 @@ Write-Host "   The following location-based groups have been assigned to setting
 Write-Host "   → $UserGroupName (user settings)" -ForegroundColor Green
 Write-Host "   → $AdminGroupName (admin settings)" -ForegroundColor Green
 
-Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '4' } else { '3' } ). Cross-Region Disaster Recovery (Optional):" -ForegroundColor Yellow
+Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '4' } else { '3' } ). Cloud PC Devices Group:" -ForegroundColor Yellow
+Write-Host "   A dynamic device security group has been created to automatically include all Cloud PC devices:" -ForegroundColor White
+Write-Host "   → $DynamicDeviceGroupName" -ForegroundColor Green
+Write-Host "   Current membership rule: (device.displayName -startsWith `"CPC-`")" -ForegroundColor White
+Write-Host "   To customize the rule (e.g., for different naming conventions), update the group membership rule in:" -ForegroundColor White
+Write-Host "   Entra ID > Groups > $DynamicDeviceGroupName > Membership rules" -ForegroundColor Cyan
+Write-Host "   Examples of other membership rules:" -ForegroundColor White
+Write-Host "     • For devices starting with 'CloudPC-': (device.displayName -startsWith `"CloudPC-`")" -ForegroundColor Gray
+Write-Host "     • For devices containing '365': (device.displayName -contains `"365`")" -ForegroundColor Gray
+Write-Host "     • For a custom category: (device.deviceCategory -eq `"CloudPC`")" -ForegroundColor Gray
+
+Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '5' } else { '4' } ). Cross-Region Disaster Recovery (Optional):" -ForegroundColor Yellow
 Write-Host "   DR settings have been created with defaults disabled." -ForegroundColor White
 Write-Host "   If you need to configure DR for your Cloud PCs, manually update the settings" -ForegroundColor White
 Write-Host "   in the Microsoft Intune admin center under Devices > Cloud PCs > User settings." -ForegroundColor White
