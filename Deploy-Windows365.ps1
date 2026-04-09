@@ -200,15 +200,14 @@ function Get-OrCreateDynamicDeviceGroup {
         [Parameter()] [string]$MembershipRule
     )
 
-    # Default membership rule for Cloud PCs based on device model
-    # This uses the deviceModel property which is more reliable than display name
-    # Customize the rule based on your needs:
-    # - For device model containing "Cloud PC": (device.deviceModel -contains "Cloud PC")
+    # Default membership rule targets Cloud PCs by naming convention (CPC- prefix).
+    # Customize the rule based on your environment:
     # - For devices starting with "CPC-": (device.displayName -startsWith "CPC-")
+    # - For device model containing "Cloud PC": (device.deviceModel -contains "Cloud PC")
     # - For devices containing "365": (device.displayName -contains "365")
     # - For device category: (device.deviceCategory -eq "CloudPC")
     if ([string]::IsNullOrWhiteSpace($MembershipRule)) {
-        $MembershipRule = '(device.deviceModel -contains "Cloud PC")'
+        $MembershipRule = '(device.displayName -startsWith "CPC-")'
     }
 
     try {
@@ -457,7 +456,7 @@ function Get-OrCreateProvisioningPolicy {
             $attemptedFallback = $false
             $languageFallbackUsed = $false
             try {
-                $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -ErrorAction Stop
                 $existing = $createResponse
             }
             catch {
@@ -466,7 +465,7 @@ function Get-OrCreateProvisioningPolicy {
                     $params.windowsSettings.language = "en-GB"
                     $attemptedFallback = $true
                     $languageFallbackUsed = $true
-                    $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                    $createResponse = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -ErrorAction Stop
                     $existing = $createResponse
                 }
                 else {
@@ -538,22 +537,12 @@ function Get-OrCreateProvisioningPolicy {
         foreach ($gid in $existingGroupIds) { if ($gid) { [void]$allGroupIds.Add($gid) } }
         foreach ($gid in $validGroupIds) { if ($gid) { [void]$allGroupIds.Add($gid) } }
 
-        # Build assignments array with complete list
-        # For Frontline, use servicePlanId instead of groupId
+        # Build assignments array with complete list (Enterprise: assign via groupId)
         $assignments = @()
-        if ($ServicePlanId) {
-            # Frontline: assign via servicePlanId
+        foreach ($gid in $allGroupIds) {
             $assignments += @{
                 id     = $null
-                target = @{ servicePlanId = $ServicePlanId }
-            }
-        } else {
-            # Enterprise: assign via groupId
-            foreach ($gid in $allGroupIds) {
-                $assignments += @{
-                    id     = $null
-                    target = @{ groupId = $gid }
-                }
+                target = @{ groupId = $gid }
             }
         }
 
@@ -820,8 +809,8 @@ if (-not $RegionChoice) {
     }
     Write-Host ""
 
-    $regionChoice = Get-ValidChoice -Min 1 -Max $regionsInGroup.Count
-    $selectedRegion = $regionsInGroup[$regionChoice - 1]
+    $regionIndexChoice = Get-ValidChoice -Min 1 -Max $regionsInGroup.Count
+    $selectedRegion = $regionsInGroup[$regionIndexChoice - 1]
 
     $SelectedRegionGroup = $selectedRegion.RegionGroup
     $SelectedRegionDisplayName = $selectedRegion.DisplayName
@@ -915,7 +904,7 @@ try {
             $availableImages = $availableImages | Sort-Object DisplayName
         }
 
-        Write-Verbose "Found $($availableImages.Count) avdailable device images"
+        Write-Verbose "Found $($availableImages.Count) available device images"
 
         # Select image
         Write-Host "`nChoose a Windows 11 image by selecting its corresponding number:" -ForegroundColor Green
@@ -1060,8 +1049,8 @@ Write-Verbose "Creating/retrieving groups..."
 Write-Verbose "Using group prefix: $GroupPrefix (customize with -GroupPrefix parameter if needed)"
 Write-Verbose "Service Plan ID: $($SelectedServicePlan.Id)"
 $GroupIDLicensing = Get-OrCreateGroup -DisplayName $LicensingGroupName -Description $LicensingGroupDescription
-$GroupIDUser      = Get-OrCreateGroup -DisplayName $UserGroupName  -Description "Windows 365 users in $LocationName"
-$GroupIDAdmin     = Get-OrCreateGroup -DisplayName $AdminGroupName -Description "Windows 365 local admins in $LocationName"
+$GroupIDUser      = Get-OrCreateGroup -DisplayName $UserGroupName  -Description "Windows 365 users in $regionLabel"
+$GroupIDAdmin     = Get-OrCreateGroup -DisplayName $AdminGroupName -Description "Windows 365 local admins in $regionLabel"
 
 # Dynamic device group for Cloud PCs
 $DynamicDeviceGroupName = "${GroupPrefix}CloudPC-Devices"
@@ -1104,24 +1093,29 @@ Write-Host "`n$('=' * 80)" -ForegroundColor Cyan
 Write-Host "PLEASE NOTE - Manual Steps Required" -ForegroundColor Cyan
 Write-Host "$('=' * 80)" -ForegroundColor Cyan
 
-Write-Host "`n1. License Assignment:" -ForegroundColor Yellow
+$step = 1
+
+Write-Host "`n$step. License Assignment:" -ForegroundColor Yellow
 Write-Host "   Assign the correct Windows 365 license to the licensing group:" -ForegroundColor White
 Write-Host "   → $LicensingGroupName" -ForegroundColor Green
+$step++
 
 if ($LicenseType -eq "Frontline") {
-    Write-Host "`n2. Frontline Policy Assignment:" -ForegroundColor Yellow
+    Write-Host "`n$step. Frontline Policy Assignment:" -ForegroundColor Yellow
     Write-Host "   ⚠️  Frontline provisioning policies require manual assignment after licenses are purchased." -ForegroundColor White
     Write-Host "   Once users receive Windows 365 Frontline licenses, the provisioning policy will" -ForegroundColor White
     Write-Host "   automatically apply based on the service plan selected." -ForegroundColor White
     Write-Host "   → Policy: $ProvisioningPolicyName" -ForegroundColor Green
+    $step++
 }
 
-Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '3' } else { '2' } ). User and Admin Group Assignments:" -ForegroundColor Yellow
+Write-Host "`n$step. User and Admin Group Assignments:" -ForegroundColor Yellow
 Write-Host "   The following location-based groups have been assigned to settings policies:" -ForegroundColor White
 Write-Host "   → $UserGroupName (user settings)" -ForegroundColor Green
 Write-Host "   → $AdminGroupName (admin settings)" -ForegroundColor Green
+$step++
 
-Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '4' } else { '3' } ). Cloud PC Devices Group:" -ForegroundColor Yellow
+Write-Host "`n$step. Cloud PC Devices Group:" -ForegroundColor Yellow
 Write-Host "   A dynamic device security group has been created to automatically include all Cloud PC devices:" -ForegroundColor White
 Write-Host "   → $DynamicDeviceGroupName" -ForegroundColor Green
 Write-Host "   Current membership rule: (device.displayName -startsWith `"CPC-`")" -ForegroundColor White
@@ -1131,8 +1125,9 @@ Write-Host "   Examples of other membership rules:" -ForegroundColor White
 Write-Host "     • For devices starting with 'CloudPC-': (device.displayName -startsWith `"CloudPC-`")" -ForegroundColor Gray
 Write-Host "     • For devices containing '365': (device.displayName -contains `"365`")" -ForegroundColor Gray
 Write-Host "     • For a custom category: (device.deviceCategory -eq `"CloudPC`")" -ForegroundColor Gray
+$step++
 
-Write-Host "`n$( if ($LicenseType -eq 'Frontline') { '5' } else { '4' } ). Cross-Region Disaster Recovery (Optional):" -ForegroundColor Yellow
+Write-Host "`n$step. Cross-Region Disaster Recovery (Optional):" -ForegroundColor Yellow
 Write-Host "   DR settings have been created with defaults disabled." -ForegroundColor White
 Write-Host "   If you need to configure DR for your Cloud PCs, manually update the settings" -ForegroundColor White
 Write-Host "   in the Microsoft Intune admin center under Devices > Cloud PCs > User settings." -ForegroundColor White
@@ -1141,5 +1136,5 @@ Write-Host "`n$('=' * 80)" -ForegroundColor Cyan
 
 # Cleanup
 Write-Verbose "Disconnecting from Microsoft Graph..."
-#Disconnect-MgGraph | Out-Null
+Disconnect-MgGraph | Out-Null
 Write-Host "`nDisconnected from Microsoft Graph." -ForegroundColor Cyan

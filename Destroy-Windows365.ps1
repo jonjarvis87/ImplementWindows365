@@ -15,16 +15,30 @@
     Destructive operation. Ensure you target the correct tenant. No soft-delete for user settings or policies.
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess)]
 param(
-    [switch]$RemoveProvisioningPolicies = $true,
-    [switch]$RemoveUserSettings = $true,
-    [switch]$RemoveGroups = $true,
+    [bool]$RemoveProvisioningPolicies = $true,
+    [bool]$RemoveUserSettings = $true,
+    [bool]$RemoveGroups = $true,
 
     [string[]]$KeepPolicies = @(),
     [string[]]$KeepUserSettings = @(),
     [string[]]$KeepGroups = @()
 )
+
+function Get-AllGraphItems {
+    param(
+        [Parameter(Mandatory)] [string]$Uri
+    )
+    $items = @()
+    $nextLink = $Uri
+    while ($nextLink) {
+        $response = Invoke-MgGraphRequest -Method GET -Uri $nextLink -ErrorAction Stop
+        if ($response.value) { $items += $response.value }
+        $nextLink = $response.'@odata.nextLink'
+    }
+    return $items
+}
 
 function Install-GraphModuleIfNeeded {
     # Align with deploy script: only require Microsoft.Graph.Authentication (lightweight, ~2MB)
@@ -61,11 +75,13 @@ function Remove-ProvisioningPolicies {
         }
         catch { Write-Warning "  Failed to clear assignments: $_" }
 
-        try {
-            Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies/$($p.id)" -ErrorAction Stop
-            Write-Host "  Deleted" -ForegroundColor Green
+        if ($PSCmdlet.ShouldProcess($p.displayName, "Delete provisioning policy")) {
+            try {
+                Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies/$($p.id)" -ErrorAction Stop
+                Write-Host "  Deleted" -ForegroundColor Green
+            }
+            catch { Write-Warning "  Failed to delete: $_" }
         }
-        catch { Write-Warning "  Failed to delete: $_" }
     }
 }
 
@@ -87,20 +103,22 @@ function Remove-UserSettings {
         }
         catch { Write-Warning "  Failed to clear assignments: $_" }
 
-        try {
-            Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings/$($s.id)" -ErrorAction Stop
-            Write-Host "  Deleted" -ForegroundColor Green
+        if ($PSCmdlet.ShouldProcess($s.displayName, "Delete user setting")) {
+            try {
+                Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings/$($s.id)" -ErrorAction Stop
+                Write-Host "  Deleted" -ForegroundColor Green
+            }
+            catch { Write-Warning "  Failed to delete: $_" }
         }
-        catch { Write-Warning "  Failed to delete: $_" }
     }
 }
 
 function Remove-Groups {
     Write-Host "Removing Entra ID groups..." -ForegroundColor Cyan
     try {
-        # Fetch up to 999 groups and filter client-side for any W365 pattern or custom prefixes
-        $resp = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$top=999" -ErrorAction Stop
-        $candidates = @($resp.value | Where-Object { $_.displayName -like '*W365*' })
+        # Fetch all groups with paging and filter client-side for any W365 pattern or custom prefixes
+        $allGroups = Get-AllGraphItems -Uri "https://graph.microsoft.com/v1.0/groups?`$select=id,displayName"
+        $candidates = @($allGroups | Where-Object { $_.displayName -like '*W365*' })
 
         foreach ($g in $candidates) {
             if ($KeepGroups -and ($g.displayName -in $KeepGroups)) {
@@ -108,11 +126,13 @@ function Remove-Groups {
                 continue
             }
             Write-Host "Deleting group: $($g.displayName)" -ForegroundColor Yellow
-            try {
-                Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/v1.0/groups/$($g.id)" -ErrorAction Stop
-                Write-Host "  Deleted" -ForegroundColor Green
+            if ($PSCmdlet.ShouldProcess($g.displayName, "Delete Entra ID group")) {
+                try {
+                    Invoke-MgGraphRequest -Method DELETE -Uri "https://graph.microsoft.com/v1.0/groups/$($g.id)" -ErrorAction Stop
+                    Write-Host "  Deleted" -ForegroundColor Green
+                }
+                catch { Write-Warning "  Failed to delete group $($g.displayName): $_" }
             }
-            catch { Write-Warning "  Failed to delete group $($g.displayName): $_" }
         }
     }
     catch { Write-Warning "Failed to query groups: $_" }
@@ -123,6 +143,20 @@ Install-GraphModuleIfNeeded
 Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
 Connect-MgGraph -Scopes "User.ReadWrite.All","Application.ReadWrite.All","CloudPC.ReadWrite.All","Group.ReadWrite.All" -ErrorAction Stop
 Write-Host "Connected." -ForegroundColor Green
+
+Write-Host "`n⚠️  WARNING: This script will permanently delete Windows 365 objects from your tenant." -ForegroundColor Red
+Write-Host "    Provisioning Policies : $RemoveProvisioningPolicies" -ForegroundColor Yellow
+Write-Host "    User Settings         : $RemoveUserSettings" -ForegroundColor Yellow
+Write-Host "    Entra ID Groups       : $RemoveGroups" -ForegroundColor Yellow
+Write-Host ""
+
+if (-not $WhatIfPreference) {
+    $confirm = Read-Host "Type YES to proceed with deletion, or anything else to abort"
+    if ($confirm -ne "YES") {
+        Write-Host "Aborted. No changes were made." -ForegroundColor Cyan
+        exit 0
+    }
+}
 
 if ($RemoveProvisioningPolicies) { Remove-ProvisioningPolicies }
 if ($RemoveUserSettings) { Remove-UserSettings }
