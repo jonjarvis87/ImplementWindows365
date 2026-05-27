@@ -146,6 +146,56 @@ function Get-OrCreateCloudPcUserSetting {
     return @{ Id = $existing.Id; Created = $wasCreated }
 }
 
+function Get-OrCreateCloudPcAiConfig {
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string]$LicensingGroupId   # Licensing group created earlier in the deployment
+    )
+
+    $response = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles?`$filter=displayName eq '$DisplayName'" `
+        -ErrorAction Stop
+    $existing = $response.value | Select-Object -First 1
+
+    if (-not $existing) {
+        $params = @{
+            displayName     = $DisplayName
+            description     = "Enables Microsoft Copilot and AI features on eligible Windows 365 Cloud PCs"
+            profileType     = "template"
+            templateId      = "W365.CloudPCConfiguration"
+            roleScopeTagIds = @("0")
+            settings        = @(
+                @{
+                    '@odata.type'       = '#microsoft.graph.cloudPcBooleanSetting'
+                    dataType            = 'boolean'
+                    settingDefinitionId = 'W365.CloudPCConfiguration.AI.IsEnabled'
+                    platform            = 'all'
+                    isEnabled           = $true
+                }
+            )
+        }
+        $existing   = Invoke-MgGraphRequest -Method POST `
+            -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles" `
+            -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -ErrorAction Stop
+        $wasCreated = $true
+    } else {
+        $wasCreated = $false
+    }
+
+    # Assign directly to the licensing group — payload format from Graph X-Ray
+    $assignPayload = @{
+        assignments = @(@{
+            groupId    = $LicensingGroupId
+            assignType = "group"
+        })
+    } | ConvertTo-Json -Depth 5
+    Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles/$($existing.id)/assign" `
+        -Body $assignPayload -ContentType "application/json" -ErrorAction Stop | Out-Null
+
+    return @{ Id = $existing.id; Created = $wasCreated }
+}
+
 function Get-OrCreateProvisioningPolicy {
     param(
         [Parameter(Mandatory)][string]$DisplayName,
@@ -157,7 +207,8 @@ function Get-OrCreateProvisioningPolicy {
         [string]$Language = "en-GB",
         [string]$ProvisioningType = "dedicated",
         [bool]$UserSettingsPersistence = $false,
-        [string]$ServicePlanId = $null
+        [string]$ServicePlanId = $null,
+        [string]$NamingTemplate = $null
     )
     $response  = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
     $existing  = $response.value | Select-Object -First 1
@@ -173,8 +224,7 @@ function Get-OrCreateProvisioningPolicy {
             enableSingleSignOn = $true
             domainJoinConfigurations = @(@{ type = "azureADJoin"; regionGroup = $RegionGroup; regionName = $CountryRegion })
             windowsSettings = @{ language = $Language }
-            cloudPcNamingTemplate = $null; scopeIds = @("0")
-            autopatch = @{ autopatchGroupId = $null }
+            cloudPcNamingTemplate = if ($NamingTemplate) { $NamingTemplate } else { $null }; scopeIds = @("0")
             userSettingsPersistenceEnabled = $UserSettingsPersistence
             userSettingsPersistenceConfiguration = @{ userSettingsPersistenceEnabled = $UserSettingsPersistence; userSettingsPersistenceStorageSizeCategory = "sixteenGB" }
             autopilotConfiguration = $null
@@ -213,7 +263,30 @@ function Get-OrCreateProvisioningPolicy {
     foreach ($gid in $validGroupIds)    { if ($gid) { [void]$allGroupIds.Add($gid) } }
 
     $assignments = @($allGroupIds | ForEach-Object { @{ id = $null; target = @{ groupId = $_ } } })
-    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies/$($existing.id)/assign" -Body (@{ assignments = $assignments } | ConvertTo-Json -Depth 10) -ContentType "application/json" -ErrorAction Stop | Out-Null
+    $assignBody  = @{ assignments = $assignments } | ConvertTo-Json -Depth 10
+
+    # Retry the assign call — the Cloud PC backend has a slower replication cycle than
+    # the main Graph directory, so groups that pass a GET check can still be "not found"
+    # here. Retry up to 10 times with a 10 s gap before giving up.
+    $assignAttempt = 0
+    $assignSuccess = $false
+    do {
+        $assignAttempt++
+        try {
+            Invoke-MgGraphRequest -Method POST `
+                -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies/$($existing.id)/assign" `
+                -Body $assignBody -ContentType "application/json" -ErrorAction Stop | Out-Null
+            $assignSuccess = $true
+        } catch {
+            $errBody = try { ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch { "$_" }
+            if ($errBody -match 'groupId.*not found' -and $assignAttempt -lt 10) {
+                Start-Sleep -Seconds 10
+            } else {
+                throw
+            }
+        }
+    } while (-not $assignSuccess -and $assignAttempt -lt 10)
+
     return @{ Id = $existing.id; Created = $wasCreated }
 }
 
@@ -313,6 +386,26 @@ function Get-OrCreateUpdateRing {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
+#  AI-SUPPORTED REGIONS
+#  W365 Copilot / AI features are only available in these Azure regions.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Normalised region keys — display name lowercased with spaces removed.
+# e.g. "UK South" → "uksouth", "West US 2" → "westus2"
+$script:AIEnabledRegions = @(
+    'westus2', 'westus3', 'eastus', 'eastus2', 'centralindia',
+    'centralus', 'southeastasia', 'australiaeast', 'uksouth',
+    'westeurope', 'northeurope', 'japaneast', 'germanywestcentral',
+    'southcentralus', 'canadacentral'
+)
+
+function Test-IsAIEnabledRegion {
+    param([Parameter(Mandatory)][string]$RegionDisplayName)
+    $normalised = ($RegionDisplayName -replace '\s','').ToLower()
+    return ($script:AIEnabledRegions | Where-Object { $_ -eq $normalised }).Count -gt 0
+}
+
+# ════════════════════════════════════════════════════════════════════════════
 #  SUPPORTED LANGUAGES
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -371,7 +464,7 @@ $script:SupportedLanguages = @(
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="Windows 365 Deployment Wizard"
+    Title="CloudEndpoint.AI — Windows 365 Deployment Wizard"
     Width="800" Height="620"
     MinWidth="800" MinHeight="620"
     WindowStartupLocation="CenterScreen"
@@ -383,7 +476,7 @@ $script:SupportedLanguages = @(
     <Window.Resources>
 
         <Style x:Key="PrimaryBtn" TargetType="Button">
-            <Setter Property="Background"      Value="#0078D4"/>
+            <Setter Property="Background"      Value="#2BC0B8"/>
             <Setter Property="Foreground"      Value="White"/>
             <Setter Property="BorderThickness" Value="0"/>
             <Setter Property="Padding"         Value="18,7"/>
@@ -395,7 +488,7 @@ $script:SupportedLanguages = @(
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Border>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#106EBE"/></Trigger>
+                            <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#1A9E98"/></Trigger>
                             <Trigger Property="IsEnabled"   Value="False"><Setter Property="Background" Value="#C8C8C8"/><Setter Property="Foreground" Value="#999"/></Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -405,8 +498,8 @@ $script:SupportedLanguages = @(
 
         <Style x:Key="SecondaryBtn" TargetType="Button">
             <Setter Property="Background"      Value="White"/>
-            <Setter Property="Foreground"      Value="#0078D4"/>
-            <Setter Property="BorderBrush"     Value="#0078D4"/>
+            <Setter Property="Foreground"      Value="#2BC0B8"/>
+            <Setter Property="BorderBrush"     Value="#2BC0B8"/>
             <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Padding"         Value="18,7"/>
             <Setter Property="Cursor"          Value="Hand"/>
@@ -417,7 +510,7 @@ $script:SupportedLanguages = @(
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
                         </Border>
                         <ControlTemplate.Triggers>
-                            <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#EBF3FB"/></Trigger>
+                            <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#E6F9F8"/></Trigger>
                             <Trigger Property="IsEnabled"   Value="False"><Setter Property="BorderBrush" Value="#CCC"/><Setter Property="Foreground" Value="#CCC"/></Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
@@ -470,13 +563,13 @@ $script:SupportedLanguages = @(
         </Grid.RowDefinitions>
 
         <!-- ═══ HEADER ═══ -->
-        <Border Grid.Row="0" Background="#0078D4">
+        <Border Grid.Row="0" Background="#111827">
             <Grid Margin="28,0">
                 <StackPanel VerticalAlignment="Center">
-                    <TextBlock Text="Windows 365 Deployment Wizard" Foreground="White" FontSize="17" FontWeight="SemiBold"/>
-                    <TextBlock x:Name="TxtPageTitle" Foreground="#B3D9F5" FontSize="12" Margin="0,3,0,0"/>
+                    <TextBlock Text="CloudEndpoint.AI  ·  Windows 365 Deployment Wizard" Foreground="White" FontSize="17" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="TxtPageTitle" Foreground="#7DD8D4" FontSize="12" Margin="0,3,0,0"/>
                 </StackPanel>
-                <TextBlock x:Name="TxtStepCount" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#B3D9F5" FontSize="12"/>
+                <TextBlock x:Name="TxtStepCount" HorizontalAlignment="Right" VerticalAlignment="Center" Foreground="#7DD8D4" FontSize="12"/>
             </Grid>
         </Border>
 
@@ -503,13 +596,51 @@ $script:SupportedLanguages = @(
                             <StackPanel x:Name="PanelLicenseType" Visibility="Collapsed" Margin="0,22,0,0">
                                 <Separator Margin="0,0,0,20"/>
                                 <TextBlock Text="Licence Type" FontWeight="SemiBold" Margin="0,0,0,10"/>
-                                <RadioButton x:Name="RbEnterprise" Content="Enterprise"  GroupName="LicenseType"/>
-                                <RadioButton x:Name="RbFrontline"  Content="Frontline"   GroupName="LicenseType"/>
 
-                                <StackPanel x:Name="PanelFrontlineType" Visibility="Collapsed" Margin="22,10,0,0">
+                                <!-- Enterprise -->
+                                <RadioButton x:Name="RbEnterprise" Content="Enterprise" GroupName="LicenseType" Margin="0,0,0,2"/>
+                                <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="20,0,0,12"
+                                    Text="Each user will get their own Cloud PC without restrictions on when they can connect to it."/>
+
+                                <!-- Frontline -->
+                                <RadioButton x:Name="RbFrontline" Content="Frontline" GroupName="LicenseType" Margin="0,0,0,2"/>
+                                <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="20,0,0,10"
+                                    Text="For each licence, assign a Frontline Cloud PC to up to 3 users. Only 1 of these users will be able to connect to their Cloud PC at a time."/>
+
+                                <StackPanel x:Name="PanelFrontlineType" Visibility="Collapsed" Margin="20,4,0,0">
                                     <TextBlock Text="Provisioning Type" FontWeight="SemiBold" Margin="0,0,0,8"/>
-                                    <RadioButton x:Name="RbFLDedicated" Content="Dedicated — shared by user"     GroupName="FLType"/>
-                                    <RadioButton x:Name="RbFLShared"    Content="Shared — shared by Entra group" GroupName="FLType"/>
+
+                                    <!-- Dedicated -->
+                                    <RadioButton x:Name="RbFLDedicated" Content="Dedicated" GroupName="FLType" Margin="0,0,0,2"/>
+                                    <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="20,0,0,10"
+                                        Text="Recommended for users who need part-time access or follow a set schedule such as shifts. A single licence lets you provision up to three Cloud PCs used non-concurrently, each assigned to a single user. Provides one concurrent session."/>
+
+                                    <!-- Shared -->
+                                    <RadioButton x:Name="RbFLShared" Content="Shared" GroupName="FLType" Margin="0,0,0,2"/>
+                                    <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="20,0,0,10"
+                                        Text="Recommended for users who use a Cloud PC for a short period of time and do not require data to be preserved. A single licence lets you provision one Cloud PC shared non-concurrently among a group of users. Provides one concurrent session."/>
+
+                                    <Separator Margin="0,14,0,12"/>
+                                    <CheckBox x:Name="ChkFLAssign" Content="Configure session assignment (optional)"
+                                              IsChecked="False" Margin="0,0,0,4" FontWeight="SemiBold"/>
+                                    <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="20,0,0,10"
+                                        Text="Assign sessions from your Frontline licence pool to the user group now. You can also do this later in the Intune portal."/>
+
+                                    <StackPanel x:Name="PanelFLAssignment" Visibility="Collapsed" Margin="20,4,0,0">
+                                        <StackPanel Margin="0,0,0,10">
+                                            <TextBlock Text="Assignment name" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                                            <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="0,0,0,6"
+                                                Text="Descriptive label shown in the Intune portal for this allotment."/>
+                                            <TextBox x:Name="TxtFLAllotmentName" Width="220" HorizontalAlignment="Left" Text="Frontline Licence"/>
+                                        </StackPanel>
+
+                                        <StackPanel>
+                                            <TextBlock Text="Number of sessions" FontWeight="SemiBold" Margin="0,0,0,4"/>
+                                            <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="0,0,0,6"
+                                                Text="Sessions to reserve for group members from your Frontline licence pool."/>
+                                            <TextBox x:Name="TxtFLSessions" Width="80" HorizontalAlignment="Left" Text="1"/>
+                                        </StackPanel>
+                                    </StackPanel>
                                 </StackPanel>
                             </StackPanel>
 
@@ -638,7 +769,49 @@ $script:SupportedLanguages = @(
                     </ScrollViewer>
                 </TabItem>
 
-                <!-- ─── PAGE 6 · Summary ─── -->
+                <!-- ─── PAGE 6 · Autopilot + Device Naming ─── -->
+                <TabItem>
+                    <ScrollViewer Margin="28,20,28,8" VerticalScrollBarVisibility="Auto">
+                        <StackPanel MaxWidth="600" HorizontalAlignment="Left">
+
+                            <!-- Autopilot profile -->
+                            <TextBlock Text="Autopilot Device Preparation Profile (Optional)" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                            <TextBlock TextWrapping="Wrap" Foreground="#666" Margin="0,0,0,12"
+                                Text="Select a device preparation profile to apply to the provisioning policy. Controls the out-of-box experience when a Cloud PC is first started. Select 'None' to skip."/>
+                            <TextBlock x:Name="TxtAutopilotStatus" Foreground="#B7950B"
+                                       FontSize="12" Margin="0,0,0,8" Visibility="Collapsed" TextWrapping="Wrap"/>
+                            <ListBox x:Name="LbAutopilot" Height="160" BorderBrush="#D0D0D0" Margin="0,0,0,0"/>
+
+                            <Separator Margin="0,20,0,20"/>
+
+                            <!-- Device naming template -->
+                            <TextBlock Text="Device Naming Template (Optional)" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                            <TextBlock TextWrapping="Wrap" Foreground="#666" Margin="0,0,0,12"
+                                Text="Create a naming template for Cloud PCs. Leave blank to use the default. Must be 5–15 characters, letters/numbers/hyphens only, no spaces, and must include %RAND:y% (y ≥ 5)."/>
+
+                            <Border BorderBrush="#E8E8E8" BorderThickness="1" CornerRadius="4" Padding="14,10" Margin="0,0,0,10">
+                                <StackPanel>
+                                    <TextBlock FontSize="12" Foreground="#555" Margin="0,0,0,4">
+                                        <Run FontWeight="SemiBold">Macros:</Run>
+                                        <Run>  %RAND:y%  — random alphanumeric string, y ≥ 5</Run>
+                                    </TextBlock>
+                                    <TextBlock FontSize="12" Foreground="#555">
+                                        <Run>             %USERNAME:x%  — first x characters of the username</Run>
+                                    </TextBlock>
+                                </StackPanel>
+                            </Border>
+
+                            <TextBlock Text="Naming Template" Foreground="#555" Margin="0,0,0,4" FontSize="12"/>
+                            <TextBox x:Name="TxtDeviceNamingTemplate" Margin="0,0,0,6"
+                                     ToolTip="Example: CPC-%RAND:5%   or   %USERNAME:4%-%RAND:5%"/>
+                            <TextBlock x:Name="TxtNamingValidation" FontSize="11" TextWrapping="Wrap"
+                                       Margin="0,0,0,0" Visibility="Collapsed"/>
+
+                        </StackPanel>
+                    </ScrollViewer>
+                </TabItem>
+
+                <!-- ─── PAGE 7 · Summary ─── -->
                 <TabItem>
                     <ScrollViewer Margin="28,20" VerticalScrollBarVisibility="Auto">
                         <StackPanel>
@@ -661,6 +834,8 @@ $script:SupportedLanguages = @(
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
                                     <TextBlock Grid.Row="0" Grid.Column="0" Text="Licence Type"    Foreground="#777" Margin="0,5"/>
                                     <TextBlock Grid.Row="0" Grid.Column="1" x:Name="SumLicenseType"  FontWeight="SemiBold" Margin="0,5" TextWrapping="Wrap"/>
@@ -676,6 +851,10 @@ $script:SupportedLanguages = @(
                                     <TextBlock Grid.Row="5" Grid.Column="1" x:Name="SumLicAssign"   FontWeight="SemiBold" Margin="0,5" TextWrapping="Wrap"/>
                                     <TextBlock Grid.Row="6" Grid.Column="0" Text="Windows Update"  Foreground="#777" Margin="0,5"/>
                                     <TextBlock Grid.Row="6" Grid.Column="1" x:Name="SumUpdateRing"  FontWeight="SemiBold" Margin="0,5" TextWrapping="Wrap"/>
+                                    <TextBlock Grid.Row="7" Grid.Column="0" Text="Autopilot"       Foreground="#777" Margin="0,5"/>
+                                    <TextBlock Grid.Row="7" Grid.Column="1" x:Name="SumAutopilot"   FontWeight="SemiBold" Margin="0,5" TextWrapping="Wrap"/>
+                                    <TextBlock Grid.Row="8" Grid.Column="0" Text="Device Naming"   Foreground="#777" Margin="0,5"/>
+                                    <TextBlock Grid.Row="8" Grid.Column="1" x:Name="SumNaming"      FontWeight="SemiBold" Margin="0,5" FontFamily="Consolas" FontSize="12"/>
                                 </Grid>
                             </Border>
 
@@ -714,7 +893,7 @@ $script:SupportedLanguages = @(
                                         <TextBlock Text="Group Prefix" Foreground="#555" Margin="0,0,0,4"/>
                                         <TextBox x:Name="TxtGroupPrefix" Text="SG-W365" Margin="0,0,0,10"/>
                                         <TextBlock Text="Provisioning Policy Suffix" Foreground="#555" Margin="0,0,0,4"/>
-                                        <TextBox x:Name="TxtPolicySuffix" Text="Provisioning Policy" Margin="0,0,0,10"/>
+                                        <TextBox x:Name="TxtPolicySuffix" Text="Policy" Margin="0,0,0,10"/>
                                         <Button x:Name="BtnRecalc" Content="Recalculate Names" Style="{StaticResource SecondaryBtn}" HorizontalAlignment="Left" Padding="12,5"/>
                                     </StackPanel>
                                 </Border>
@@ -787,6 +966,9 @@ $script:state = @{
     IsConnected               = $false
     LicenseType               = $null
     FrontlineType             = 'sharedByUser'
+    FrontlineAllotmentCount   = 1
+    FrontlineAllotmentName    = 'Frontline Licence'
+    FrontlineAssignSessions   = $false
     SelectedServicePlan       = $null
     SelectedRegionGroup       = $null
     SelectedRegionName        = $null
@@ -797,6 +979,9 @@ $script:state = @{
     UpdateRingProfile         = 'standard'
     UpdateRingName            = 'W365-CloudPC-UpdateRing'
     EnableAutopatch           = $false
+    AutopilotProfiles         = @()
+    SelectedAutopilotProfile  = $null   # $null = None/Skip
+    DeviceNamingTemplate      = ""
     CalculatedNames           = $null
     ServicePlans              = @()
     AllRegions                = @()
@@ -806,7 +991,7 @@ $script:state = @{
 }
 
 $script:currentPage = 0
-$script:totalPages  = 7   # pages 0-6, results = page 7
+$script:totalPages  = 8   # pages 0-7, results = page 8
 $script:pageTitles  = @(
     'Connect to Microsoft Graph'
     'Select Cloud PC SKU'
@@ -814,6 +999,7 @@ $script:pageTitles  = @(
     'Select Windows 11 Image'
     'Select Language'
     'Windows Update Settings'
+    'Autopilot Profile & Device Naming'
     'Review & Confirm'
     'Deployment Results'
 )
@@ -864,12 +1050,16 @@ function Show-Alert {
 
 function Update-Summary {
     $prefix = (ctrl 'TxtGroupPrefix').Text.Trim(); if (-not $prefix) { $prefix = "SG-W365" }
-    $suffix = (ctrl 'TxtPolicySuffix').Text.Trim(); if (-not $suffix) { $suffix = "Provisioning Policy" }
+    $suffix = (ctrl 'TxtPolicySuffix').Text.Trim(); if (-not $suffix) { $suffix = "Policy" }
 
     $regionLabel      = (Get-Culture).TextInfo.ToTitleCase(($script:state.SelectedRegionName -replace '[_-]',' ').ToLower().Trim())
     $policyRegionRaw  = $script:state.SelectedRegionDisplayName ?? $script:state.SelectedRegionName
     $policyRegionName = (Get-Culture).TextInfo.ToTitleCase($policyRegionRaw.ToLower().Trim())
     $licInfix         = if ($script:state.LicenseType -eq "Frontline") { "FL" } else { "ENT" }
+    $flVariant        = if ($script:state.LicenseType -eq "Frontline") {
+                            if ($script:state.FrontlineType -eq 'sharedByEntraGroup') { "Shared" } else { "Dedicated" }
+                        } else { $null }
+    $policyTypePart   = if ($flVariant) { "Frontline-$flVariant" } else { $script:state.LicenseType }
 
     $script:state.CalculatedNames = @{
         GroupPrefix    = $prefix
@@ -878,10 +1068,10 @@ function Update-Summary {
         UserGroup      = "${prefix}-${licInfix}-${regionLabel}-User"
         AdminGroup     = "${prefix}-${licInfix}-${regionLabel}-Admin"
         DevicesGroup   = "${prefix}CloudPC-Devices"
-        PolicyName     = "${policyRegionName}-W365-$($script:state.LicenseType)-${suffix}"
+        PolicyName     = "${policyRegionName}-W365-${policyTypePart}-${suffix}"
     }
 
-    $licAssignText   = if ($script:state.LicenseType -eq 'Enterprise') { "Automatic (group-based licensing)" } else { "Manual — Frontline licences assigned by service plan" }
+    $licAssignText   = if ($script:state.LicenseType -eq 'Enterprise') { "Automatic (group-based licensing)" } else { "Automatic — provisioning policy assigned with service plan allotment" }
     $updateRingText  = if ($script:state.CreateUpdateRing) { "$($script:state.UpdateRingProfile) profile  [$($script:state.UpdateRingName)]" } else { "Skipped" }
     if ($script:state.EnableAutopatch) { $updateRingText += "  +  Autopatch enabled" }
 
@@ -892,6 +1082,8 @@ function Update-Summary {
     (ctrl 'SumLanguage').Text     = $script:state.SelectedLanguage.DisplayName
     (ctrl 'SumLicAssign').Text    = $licAssignText
     (ctrl 'SumUpdateRing').Text   = $updateRingText
+    (ctrl 'SumAutopilot').Text   = if ($script:state.SelectedAutopilotProfile) { $script:state.SelectedAutopilotProfile.name } else { "None — skipped" }
+    (ctrl 'SumNaming').Text      = if ($script:state.DeviceNamingTemplate) { $script:state.DeviceNamingTemplate } else { "Default (not set)" }
     (ctrl 'SumLicGroup').Text     = $script:state.CalculatedNames.LicensingGroup
     (ctrl 'SumUserGroup').Text    = $script:state.CalculatedNames.UserGroup
     (ctrl 'SumAdminGroup').Text   = $script:state.CalculatedNames.AdminGroup
@@ -970,15 +1162,40 @@ function Start-Deployment {
         $rAdmin   = Get-OrCreateGroup -DisplayName $names.AdminGroup      -Description "Windows 365 local admins in $($script:state.SelectedRegionDisplayName)"
         $rDevices = Get-OrCreateDynamicDeviceGroup -DisplayName $names.DevicesGroup -Description "Dynamic group — all Windows 365 Cloud PC devices (CPC-* prefix)"
 
-        # Group replication wait
-        for ($i = 10; $i -gt 0; $i--) {
+        # Group replication wait — Entra ID can take 30-90 s to replicate new groups
+        # across the directory. We wait an initial 30 s then verify each group is
+        # reachable via Graph before proceeding; retry for up to 60 s more if not.
+        $groupIdsToVerify = @($rLic.Id, $rUser.Id, $rAdmin.Id)
+        for ($i = 15; $i -gt 0; $i--) {
             (ctrl 'TxtLoading').Text = "Waiting for group replication ($i s)..."
             $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
             Start-Sleep -Seconds 1
         }
+        # Verify groups are accessible; retry up to 12 × 5 s = 60 s extra
+        $retries = 0
+        $maxRetries = 12
+        do {
+            $missing = @()
+            foreach ($gid in $groupIdsToVerify) {
+                try {
+                    Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$gid" -ErrorAction Stop | Out-Null
+                } catch {
+                    $missing += $gid
+                }
+            }
+            if ($missing.Count -gt 0 -and $retries -lt $maxRetries) {
+                $retries++
+                for ($i = 5; $i -gt 0; $i--) {
+                    (ctrl 'TxtLoading').Text = "Waiting for group replication ($($missing.Count) group(s) pending, retry $retries/$maxRetries — $i s)..."
+                    $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
+                    Start-Sleep -Seconds 1
+                }
+            }
+        } while ($missing.Count -gt 0 -and $retries -lt $maxRetries)
 
         # ── Licence assignment ────────────────────────────────────────────
-        $licResult = $null
+        $licResult        = $null
+        $rFrontlineAssign = $null
         if ($script:state.LicenseType -eq 'Enterprise') {
             Show-Loading "Assigning Windows 365 licence to licensing group..."
             try {
@@ -995,14 +1212,26 @@ function Start-Deployment {
         $rUserSettings  = Get-OrCreateCloudPcUserSetting -DisplayName "W365_UserSettings"  -LocalAdminEnabled $false -TargetGroupId $rUser.Id
 
         $isCopilot   = Test-IsCopilotEligibleSku -DisplayName $script:state.SelectedServicePlan.DisplayName
-        $rAiSettings = $null
-        if ($isCopilot) {
-            $rAiSettings = Get-OrCreateCloudPcUserSetting -DisplayName "AI_Enabled_Cloud_PC" -LocalAdminEnabled $false -TargetGroupId $rLic.Id
+        $isAIRegion  = Test-IsAIEnabledRegion   -RegionDisplayName $script:state.SelectedRegionDisplayName
+        $rAiConfig   = $null
+        if ($isCopilot -and $isAIRegion) {
+            Show-Loading "Creating AI Cloud PC configuration..."
+            try {
+                $rAiConfig = Get-OrCreateCloudPcAiConfig -DisplayName "W365_Frontier_AIEnabled" -LicensingGroupId $rLic.Id
+            } catch {
+                # Extract a clean message — the raw exception may itself contain unparseable content
+                $errMsg = $null
+                try   { $errMsg = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch {}
+                if (-not $errMsg) { try { $errMsg = ($_ | Select-Object -ExpandProperty Message -ErrorAction Stop) } catch {} }
+                if (-not $errMsg) { $errMsg = "$_" }
+                $rAiConfig = @{ Id = $null; Created = $false; Error = $errMsg }
+            }
+            Show-Loading "Creating provisioning policy..."
         }
 
         # ── Provisioning policy ───────────────────────────────────────────
         Show-Loading "Creating provisioning policy..."
-        $provType        = $script:state.FrontlineType ?? 'dedicated'
+        $provType        = if ($script:state.LicenseType -eq 'Frontline') { $script:state.FrontlineType ?? 'sharedByUser' } else { 'dedicated' }
         $userPersistence = ($script:state.LicenseType -eq 'Frontline' -and $script:state.FrontlineType -eq 'sharedByEntraGroup')
         $servicePlanId   = if ($script:state.LicenseType -eq 'Frontline') { $script:state.SelectedServicePlan.Id } else { $null }
 
@@ -1016,7 +1245,63 @@ function Start-Deployment {
             -Language                $script:state.SelectedLanguage.Code `
             -ProvisioningType        $provType `
             -UserSettingsPersistence $userPersistence `
-            -ServicePlanId           $servicePlanId
+            -ServicePlanId           $servicePlanId `
+            -NamingTemplate          $script:state.DeviceNamingTemplate
+
+        # ── Frontline provisioning policy assignment ──────────────────────
+        # For Frontline, the /assign payload must include servicePlanId,
+        # allotmentDisplayName, and allotmentLicensesCount in the target —
+        # a plain group assignment is rejected by the Cloud PC backend.
+        # The user group gets the service-plan-aware target; the admin group
+        # gets a standard target (local admin rights, no licence allotment).
+        if ($script:state.LicenseType -eq 'Frontline' -and $script:state.FrontlineAssignSessions) {
+            Show-Loading "Assigning Frontline provisioning policy..."
+            $flAttempt = 0
+            $flSuccess = $false
+            $flError   = $null
+            do {
+                $flAttempt++
+                try {
+                    $flBody = @{
+                        assignments = @(
+                            @{
+                                id     = ""
+                                target = @{
+                                    groupId                = $rUser.Id
+                                    servicePlanId          = $script:state.SelectedServicePlan.Id
+                                    allotmentDisplayName   = $script:state.FrontlineAllotmentName
+                                    allotmentLicensesCount = $script:state.FrontlineAllotmentCount
+                                }
+                            }
+                        )
+                    } | ConvertTo-Json -Depth 10
+                    Invoke-MgGraphRequest -Method POST `
+                        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies/$($rPolicy.Id)/assign" `
+                        -Body $flBody -ContentType "application/json" -ErrorAction Stop | Out-Null
+                    $flSuccess = $true
+                } catch {
+                    # Safely extract the real error — the Graph API sometimes returns
+                    # plain text (e.g. "Policy not found") rather than JSON, so we
+                    # must not unconditionally pass ErrorDetails.Message to ConvertFrom-Json.
+                    $rawMsg = $null
+                    try { $rawMsg = $_.ErrorDetails.Message } catch {}
+                    if ($rawMsg) {
+                        try   { $flError = ($rawMsg | ConvertFrom-Json -ErrorAction Stop).error.message }
+                        catch { $flError = $rawMsg }   # plain-text response — use as-is
+                    } else {
+                        $flError = $_.Exception.Message
+                    }
+                    if ($flError -match 'not found|notFound|does not exist|replication' -and $flAttempt -lt 6) {
+                        for ($i = 10; $i -gt 0; $i--) {
+                            (ctrl 'TxtLoading').Text = "Waiting for policy replication ($i s, attempt $flAttempt/6)..."
+                            $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
+                            Start-Sleep -Seconds 1
+                        }
+                    } else { break }
+                }
+            } while (-not $flSuccess -and $flAttempt -lt 6)
+            $rFrontlineAssign = @{ Success = $flSuccess; Error = $flError }
+        }
 
         # ── Windows Update for Business ring ─────────────────────────────
         $rUpdateRing = $null
@@ -1033,28 +1318,8 @@ function Start-Deployment {
         }
 
         # ── Autopatch ─────────────────────────────────────────────────────
-        $autopatchNote = ""
-        if ($script:state.EnableAutopatch) {
-            Show-Loading "Enabling Autopatch on provisioning policy..."
-            try {
-                # Fetch Autopatch groups to get the default group ID
-                $apGroups = Invoke-MgGraphRequest -Method GET `
-                    -Uri "https://graph.microsoft.com/beta/deviceManagement/autopatchGroups" `
-                    -ErrorAction Stop
-                $defaultGroup = $apGroups.value | Where-Object { $_.isDefaultGroup -eq $true } | Select-Object -First 1
-                if ($defaultGroup) {
-                    $apPatch = @{ autopatch = @{ autopatchGroupId = $defaultGroup.id } }
-                    Invoke-MgGraphRequest -Method PATCH `
-                        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies/$($rPolicy.Id)" `
-                        -Body ($apPatch | ConvertTo-Json -Depth 4) -ContentType "application/json" -ErrorAction Stop | Out-Null
-                    $autopatchNote = "Autopatch group: $($defaultGroup.displayName)"
-                } else {
-                    $autopatchNote = "⚠️ No default Autopatch group found — configure Autopatch in Intune first"
-                }
-            } catch {
-                $autopatchNote = "⚠️ Autopatch could not be applied: $_"
-            }
-        }
+        # Autopatch requires an internal autopatchGroupId that cannot be retrieved via Graph API.
+        # Enabled by the user in the Intune portal after deployment (manual step).
 
         Hide-Loading
 
@@ -1071,20 +1336,37 @@ function Start-Deployment {
         Add-ResultSection "Licence Assignment"
         if ($licResult) {
             Add-ResultRow "SKU" $licResult.SkuPartNumber -Created $true -Note $licResult.Warning
+        } elseif ($rFrontlineAssign) {
+            if ($rFrontlineAssign.Success) {
+                Add-ResultRow "Frontline" "$($script:state.SelectedServicePlan.DisplayName)  →  $($names.UserGroup)  [$($script:state.FrontlineAllotmentCount) session(s)]" -Created $true
+            } else {
+                Add-ResultNote "⚠️ Frontline policy assignment failed: $($rFrontlineAssign.Error)" "#C50F1F"
+                Add-ResultNote "Manual step: open the provisioning policy in Intune and assign it to '$($names.UserGroup)' with service plan '$($script:state.SelectedServicePlan.DisplayName)'." "#666666"
+            }
+        } elseif ($script:state.LicenseType -eq 'Frontline') {
+            Add-ResultNote "Skipped — configure session assignment in the Intune portal when ready."
         } else {
-            Add-ResultNote "Skipped — Frontline licences are assigned per service plan automatically."
+            Add-ResultNote "Skipped."
         }
 
         Add-ResultSection "Cloud PC User Settings"
         Add-ResultRow "Admin Settings" "W365_AdminSettings" -Created $rAdminSettings.Created
         Add-ResultRow "User Settings"  "W365_UserSettings"  -Created $rUserSettings.Created
-        if ($isCopilot -and $rAiSettings) {
-            Add-ResultRow "AI Settings" "AI_Enabled_Cloud_PC" -Created $rAiSettings.Created
+        if ($isCopilot -and $isAIRegion) {
+            if ($rAiConfig.Error) {
+                Add-ResultNote "⚠️ AI Cloud PC config could not be created: $($rAiConfig.Error)"
+            } else {
+                Add-ResultRow "AI Config" "W365_Frontier_AIEnabled" -Created $rAiConfig.Created
+            }
+        } elseif ($isCopilot -and -not $isAIRegion) {
+            Add-ResultNote "ℹ️ AI Cloud PC config skipped — region '$($script:state.SelectedRegionDisplayName)' is not yet supported for W365 AI features."
         }
 
         Add-ResultSection "Provisioning Policy"
         Add-ResultRow "Policy" $names.PolicyName -Created $rPolicy.Created
-        if ($autopatchNote) { Add-ResultNote $autopatchNote }
+        if ($script:state.EnableAutopatch) {
+            Add-ResultNote "⚠️ Autopatch — manual step required (see Next Steps below)"
+        }
 
         Add-ResultSection "Windows Update"
         if ($rUpdateRing) {
@@ -1093,6 +1375,35 @@ function Start-Deployment {
             } else {
                 Add-ResultRow "Update Ring" $script:state.UpdateRingName -Created $rUpdateRing.Created
             }
+        } else {
+            Add-ResultNote "Skipped."
+        }
+
+        # ── Autopilot device preparation profile ──────────────────────────
+        Add-ResultSection "Autopilot Profile"
+        if ($script:state.SelectedAutopilotProfile) {
+            Show-Loading "Applying Autopilot device preparation profile to provisioning policy..."
+            $apName = $script:state.SelectedAutopilotProfile.name
+            $apId   = $script:state.SelectedAutopilotProfile.id
+            try {
+                # Patch the provisioning policy with the device preparation profile ID.
+                # This is the exact payload captured via Graph X-Ray from the Intune portal.
+                $apPayload = @{
+                    autopilotConfiguration = @{
+                        devicePreparationProfileId   = $apId
+                        applicationTimeoutInMinutes  = 60
+                        onFailureDeviceAccessDenied  = $false
+                    }
+                } | ConvertTo-Json -Depth 4
+                Invoke-MgGraphRequest -Method PATCH `
+                    -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies/$($rPolicy.Id)" `
+                    -Body $apPayload -ContentType "application/json" -ErrorAction Stop | Out-Null
+                Add-ResultRow "Profile" $apName -Created $true
+            } catch {
+                $errMsg = try { ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch { $_.ToString() }
+                Add-ResultNote "⚠️ Could not apply Autopilot profile: $errMsg"
+            }
+            Hide-Loading
         } else {
             Add-ResultNote "Skipped."
         }
@@ -1107,13 +1418,19 @@ function Start-Deployment {
                 $script:state.ManualStepsText += "$step. Licence Assignment (MANUAL)`n   Assign '$($script:state.SelectedServicePlan.DisplayName)' to:`n   $($names.LicensingGroup)`n`n"
             }
         } else {
-            $script:state.ManualStepsText += "$step. Frontline Licence`n   Assign policy '$($names.PolicyName)' once Frontline licences are purchased.`n`n"
+            if ($rFrontlineAssign -and $rFrontlineAssign.Success) {
+                $script:state.ManualStepsText += "$step. Frontline Licence Assignment (DONE — policy assigned with service plan allotment)`n   Policy   : $($names.PolicyName)`n   Group    : $($names.UserGroup)`n   Plan     : $($script:state.SelectedServicePlan.DisplayName)`n   Sessions : $($script:state.FrontlineAllotmentCount)`n`n"
+            } elseif ($rFrontlineAssign -and -not $rFrontlineAssign.Success) {
+                $script:state.ManualStepsText += "$step. Frontline Licence Assignment (MANUAL — assignment failed)`n   Open the Intune portal > Devices > Windows 365 > Provisioning policies`n   Assign '$($names.PolicyName)' to '$($names.UserGroup)' with service plan '$($script:state.SelectedServicePlan.DisplayName)'.`n`n"
+            } else {
+                $script:state.ManualStepsText += "$step. Frontline Licence Assignment (SKIPPED — configure when ready)`n   Open the Intune portal > Devices > Windows 365 > Provisioning policies`n   Assign '$($names.PolicyName)' to '$($names.UserGroup)' with service plan '$($script:state.SelectedServicePlan.DisplayName)'.`n`n"
+            }
         }
         $step++
         $script:state.ManualStepsText += "$step. User & Admin Groups`n   User  : $($names.UserGroup)`n   Admin : $($names.AdminGroup)`n`n"; $step++
         $script:state.ManualStepsText += "$step. Devices Group (auto-populates from CPC-* naming)`n   $($names.DevicesGroup)`n`n"; $step++
         if ($script:state.EnableAutopatch) {
-            $script:state.ManualStepsText += "$step. Autopatch`n   Verify Autopatch activation in Intune > Tenant administration > Windows Autopatch.`n`n"; $step++
+            $script:state.ManualStepsText += "$step. Autopatch (MANUAL)`n   1. Open Intune admin centre > Devices > Windows 365 > Provisioning policies`n   2. Open '$($names.PolicyName)'`n   3. Under 'Windows updates', select 'Autopatch' and save.`n`n"; $step++
         }
         $script:state.ManualStepsText += "$step. Cross-Region DR (optional)`n   Intune admin centre > Devices > Cloud PCs > User settings.`n"
 
@@ -1121,7 +1438,7 @@ function Start-Deployment {
         Add-ResultNote "Click 'Copy Manual Steps to Clipboard' for the full post-deployment checklist."
 
         Disconnect-MgGraph | Out-Null
-        Set-Page 7
+        Set-Page 8
     }
     catch {
         Hide-Loading
@@ -1133,7 +1450,7 @@ function Start-Deployment {
         (ctrl 'PanelResults').Children.Add($errTb) | Out-Null
         (ctrl 'BtnDeploy').IsEnabled = $true
         (ctrl 'BtnBack').IsEnabled   = $true
-        Set-Page 7
+        Set-Page 8
     }
 }
 
@@ -1149,6 +1466,22 @@ function Move-Next {
             if (-not $script:state.LicenseType)  { Show-Alert "Please select a licence type." "Selection Required"; return }
             if ($script:state.LicenseType -eq "Frontline" -and -not $script:state.FrontlineType) {
                 Show-Alert "Please select a Frontline provisioning type." "Selection Required"; return
+            }
+            if ($script:state.LicenseType -eq "Frontline") {
+                $script:state.FrontlineAssignSessions = (ctrl 'ChkFLAssign').IsChecked -eq $true
+                if ($script:state.FrontlineAssignSessions) {
+                    $rawSessions = (ctrl 'TxtFLSessions').Text.Trim()
+                    $parsedSessions = 0
+                    if (-not [int]::TryParse($rawSessions, [ref]$parsedSessions) -or $parsedSessions -lt 1) {
+                        Show-Alert "Number of sessions must be a whole number of 1 or more." "Invalid Value"; return
+                    }
+                    $rawAllotmentName = (ctrl 'TxtFLAllotmentName').Text.Trim()
+                    if (-not $rawAllotmentName) {
+                        Show-Alert "Please enter an assignment name." "Invalid Value"; return
+                    }
+                    $script:state.FrontlineAllotmentCount = $parsedSessions
+                    $script:state.FrontlineAllotmentName  = $rawAllotmentName
+                }
             }
             Show-Loading "Retrieving Cloud PC service plans..."
             try {
@@ -1182,7 +1515,8 @@ function Move-Next {
                 $script:state.AllRegions = @($raw | ForEach-Object {
                     $rg = $_.regionGroup ?? $_.RegionGroup
                     $dn = $_.displayName ?? $_.DisplayName
-                    [pscustomobject]@{ RegionGroup = $rg; DisplayName = $dn; RegionName = $dn }
+                    $rid = ($_.id ?? $_.Id) -replace '\s','' # internal name e.g. "uksouth"
+                    [pscustomobject]@{ RegionGroup = $rg; DisplayName = $dn; RegionName = $dn; RegionId = $rid }
                 } | Sort-Object RegionGroup, DisplayName)
 
                 $uniqueGroups = @($script:state.AllRegions.RegionGroup | Sort-Object -Unique)
@@ -1206,6 +1540,7 @@ function Move-Next {
             $script:state.SelectedRegionGroup        = $selGroup.Value
             $script:state.SelectedRegionDisplayName  = $selRegion.Display
             $script:state.SelectedRegionName         = $selRegion.Value
+            $script:state.SelectedRegionId           = $selRegion.Id
             Show-Loading "Retrieving Windows 11 gallery images..."
             try {
                 $imgs = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/galleryImages"
@@ -1230,7 +1565,7 @@ function Move-Next {
             Set-Page 5
         }
 
-        5 { # Windows Update — read selections then go to summary
+        5 { # Windows Update — save selections, load Autopilot profiles, go to page 6
             $script:state.CreateUpdateRing = (ctrl 'ChkCreateUpdateRing').IsChecked
             $script:state.UpdateRingName   = (ctrl 'TxtUpdateRingName').Text.Trim()
             if (-not $script:state.UpdateRingName) { $script:state.UpdateRingName = "W365-CloudPC-UpdateRing" }
@@ -1240,8 +1575,87 @@ function Move-Next {
                 default                              { 'standard' }
             }
             $script:state.EnableAutopatch = (ctrl 'ChkAutopatch').IsChecked
+
+            Show-Loading "Retrieving Autopilot device preparation profiles..."
+            $script:state.AutopilotProfiles = @()
+            $lb = ctrl 'LbAutopilot'; $lb.Items.Clear()
+            $lb.Items.Add("None — skip Autopilot profile assignment")
+            $lb.SelectedIndex = 0
+
+            $status = ctrl 'TxtAutopilotStatus'
+            try {
+                $allPolicies = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?`$filter=technologies eq 'enrollment'&`$select=id,name,templateReference"
+                $profiles = @($allPolicies | Where-Object { $_.templateReference.templateDisplayName -eq 'Win365 Device Preparation' } | Sort-Object name)
+                $script:state.AutopilotProfiles = $profiles
+                $script:state.AutopilotProfiles | ForEach-Object { $lb.Items.Add($_.name) }
+
+                if ($script:state.AutopilotProfiles.Count -eq 0) {
+                    $status.Text       = "No Autopilot device preparation profiles found in this tenant."
+                    $status.Foreground = [System.Windows.Media.Brushes]::DimGray
+                    $status.Visibility = 'Visible'
+                } else {
+                    $status.Visibility = 'Collapsed'
+                }
+            } catch {
+                # Endpoint may vary by tenant configuration — allow the user to skip
+                $errMsg = try { ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch { $null }
+                if (-not $errMsg) { $errMsg = if ($_ -match '"message"\s*:\s*"([^"]+)"') { $Matches[1] } else { "endpoint unavailable" } }
+                $status.Text       = "⚠️ Could not load Autopilot profiles ($errMsg). Select 'None' to skip."
+                $status.Foreground = [System.Windows.Media.Brushes]::DarkGoldenrod
+                $status.Visibility = 'Visible'
+            }
+            Hide-Loading; Set-Page 6
+        }
+
+        6 { # Autopilot + Device Naming — validate, save, go to summary
+            $lb = ctrl 'LbAutopilot'
+            $script:state.SelectedAutopilotProfile = if ($lb.SelectedIndex -le 0) {
+                $null
+            } else {
+                $script:state.AutopilotProfiles[$lb.SelectedIndex - 1]
+            }
+
+            # Validate naming template (optional field)
+            $namingRaw = (ctrl 'TxtDeviceNamingTemplate').Text.Trim()
+            $valTb     = ctrl 'TxtNamingValidation'
+            if ($namingRaw) {
+                $errors = @()
+
+                # Must not contain spaces
+                if ($namingRaw -match ' ') { $errors += "Must not contain spaces." }
+
+                # Must contain %RAND:y% with y >= 5
+                if ($namingRaw -match '%RAND:(\d+)%') {
+                    if ([int]$Matches[1] -lt 5) { $errors += "%RAND:y% — y must be 5 or more (found $($Matches[1]))." }
+                } else {
+                    $errors += "Must include a %RAND:y% macro (y ≥ 5)."
+                }
+
+                # Calculate effective length: replace macros with their output lengths
+                $expanded = $namingRaw
+                $expanded = [regex]::Replace($expanded, '%RAND:(\d+)%',    { param($m) 'X' * [int]$m.Groups[1].Value })
+                $expanded = [regex]::Replace($expanded, '%USERNAME:(\d+)%', { param($m) 'X' * [int]$m.Groups[1].Value })
+                if ($expanded.Length -lt 5)  { $errors += "Effective length is $($expanded.Length) — minimum is 5 characters." }
+                if ($expanded.Length -gt 15) { $errors += "Effective length is $($expanded.Length) — maximum is 15 characters." }
+
+                # Only letters, numbers, hyphens outside of macros
+                $stripped = [regex]::Replace($namingRaw, '%[A-Z]+:\d+%', '')
+                if ($stripped -match '[^A-Za-z0-9\-]') { $errors += "Only letters, numbers, and hyphens are allowed outside macros." }
+
+                if ($errors.Count -gt 0) {
+                    $valTb.Text       = "⚠️  " + ($errors -join "  |  ")
+                    $valTb.Foreground = [System.Windows.Media.Brushes]::Crimson
+                    $valTb.Visibility = 'Visible'
+                    return
+                }
+                $valTb.Visibility = 'Collapsed'
+            } else {
+                $valTb.Visibility = 'Collapsed'
+            }
+
+            $script:state.DeviceNamingTemplate = $namingRaw
             Update-Summary
-            Set-Page 6
+            Set-Page 7
         }
     }
 }
@@ -1254,7 +1668,7 @@ function Move-Next {
     Show-Loading "Connecting to Microsoft Graph..."
     try {
         Install-GraphModuleIfNeeded
-        Connect-MgGraph -Scopes "User.ReadWrite.All","Application.ReadWrite.All","CloudPC.ReadWrite.All","Group.ReadWrite.All","LicenseAssignment.ReadWrite.All","DeviceManagementConfiguration.ReadWrite.All" -ErrorAction Stop
+        Connect-MgGraph -Scopes "User.ReadWrite.All","Application.ReadWrite.All","CloudPC.ReadWrite.All","Group.ReadWrite.All","LicenseAssignment.ReadWrite.All","DeviceManagementConfiguration.ReadWrite.All","DeviceManagementServiceConfig.ReadWrite.All" -ErrorAction Stop
         $script:state.IsConnected = $true
         (ctrl 'TxtConnectionStatus').Text       = [char]0x2714 + "  Connected to Microsoft Graph"
         (ctrl 'TxtConnectionStatus').Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(16,124,16))
@@ -1271,20 +1685,49 @@ function Move-Next {
 (ctrl 'RbFrontline').Add_Checked({  $script:state.LicenseType = "Frontline";  (ctrl 'PanelFrontlineType').Visibility = 'Visible' })
 (ctrl 'RbFLDedicated').Add_Checked({ $script:state.FrontlineType = "sharedByUser" })
 (ctrl 'RbFLShared').Add_Checked({    $script:state.FrontlineType = "sharedByEntraGroup" })
+(ctrl 'ChkFLAssign').Add_Checked({   (ctrl 'PanelFLAssignment').Visibility = 'Visible' })
+(ctrl 'ChkFLAssign').Add_Unchecked({ (ctrl 'PanelFLAssignment').Visibility = 'Collapsed' })
+(ctrl 'TxtFLSessions').Add_TextChanged({
+    $raw = (ctrl 'TxtFLSessions').Text.Trim()
+    $parsed = 0
+    if ([int]::TryParse($raw, [ref]$parsed) -and $parsed -ge 1) {
+        $script:state.FrontlineAllotmentCount = $parsed
+    }
+})
+(ctrl 'TxtFLAllotmentName').Add_TextChanged({
+    $raw = (ctrl 'TxtFLAllotmentName').Text.Trim()
+    if ($raw) { $script:state.FrontlineAllotmentName = $raw }
+})
 
 (ctrl 'LbRegionGroup').Add_SelectionChanged({
     $selGroup = (ctrl 'LbRegionGroup').SelectedItem
     if (-not $selGroup) { return }
     $regions  = @($script:state.AllRegions | Where-Object { $_.RegionGroup -eq $selGroup.Value } | Sort-Object DisplayName)
     $lbRegion = ctrl 'LbRegion'; $lbRegion.Items.Clear()
-    $regions | ForEach-Object { $lbRegion.Items.Add([pscustomobject]@{ Display = $_.DisplayName; Value = $_.RegionName }) }
+    $regions | ForEach-Object { $lbRegion.Items.Add([pscustomobject]@{ Display = $_.DisplayName; Value = $_.RegionName; Id = $_.RegionId }) }
     $lbRegion.DisplayMemberPath = 'Display'
 })
 
-(ctrl 'ChkCreateUpdateRing').Add_Checked({   (ctrl 'PanelUpdateRing').Visibility = 'Visible' })
-(ctrl 'ChkCreateUpdateRing').Add_Unchecked({ (ctrl 'PanelUpdateRing').Visibility = 'Collapsed' })
-(ctrl 'ChkAutopatch').Add_Checked({          (ctrl 'PanelAutopatch').Visibility  = 'Visible' })
-(ctrl 'ChkAutopatch').Add_Unchecked({        (ctrl 'PanelAutopatch').Visibility  = 'Collapsed' })
+(ctrl 'ChkCreateUpdateRing').Add_Checked({
+    (ctrl 'PanelUpdateRing').Visibility  = 'Visible'
+    (ctrl 'ChkAutopatch').IsEnabled      = $false
+    (ctrl 'ChkAutopatch').IsChecked      = $false
+    (ctrl 'PanelAutopatch').Visibility   = 'Collapsed'
+})
+(ctrl 'ChkCreateUpdateRing').Add_Unchecked({
+    (ctrl 'PanelUpdateRing').Visibility  = 'Collapsed'
+    (ctrl 'ChkAutopatch').IsEnabled      = $true
+})
+(ctrl 'ChkAutopatch').Add_Checked({
+    (ctrl 'PanelAutopatch').Visibility       = 'Visible'
+    (ctrl 'ChkCreateUpdateRing').IsEnabled   = $false
+    (ctrl 'ChkCreateUpdateRing').IsChecked   = $false
+    (ctrl 'PanelUpdateRing').Visibility      = 'Collapsed'
+})
+(ctrl 'ChkAutopatch').Add_Unchecked({
+    (ctrl 'PanelAutopatch').Visibility       = 'Collapsed'
+    (ctrl 'ChkCreateUpdateRing').IsEnabled   = $true
+})
 
 (ctrl 'TxtLanguageSearch').Add_GotFocus({
     if ((ctrl 'TxtLanguageSearch').Tag -eq 'placeholder') {
@@ -1330,5 +1773,8 @@ $script:SupportedLanguages | ForEach-Object { (ctrl 'LbLanguage').Items.Add($_.D
 # ════════════════════════════════════════════════════════════════════════════
 #  LAUNCH
 # ════════════════════════════════════════════════════════════════════════════
+# Apply initial mutual-exclusion state (ChkCreateUpdateRing starts checked)
+(ctrl 'ChkAutopatch').IsEnabled = $false
+
 Set-Page 0
 $window.ShowDialog() | Out-Null
