@@ -189,7 +189,7 @@ function Clear-PolicyAssignments {
                     <StackPanel Margin="32,28,32,16" MaxWidth="480" HorizontalAlignment="Left">
                         <TextBlock Text="Sign in to Microsoft Graph" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,6"/>
                         <TextBlock TextWrapping="Wrap" Foreground="#666" Margin="0,0,0,18"
-                            Text="Sign in with an account that has CloudPC.ReadWrite.All and Group.ReadWrite.All permissions."/>
+                            Text="Sign in with an account that has CloudPC.ReadWrite.All, Group.ReadWrite.All and DeviceManagementConfiguration.ReadWrite.All permissions."/>
                         <Button x:Name="BtnConnect" Content="Sign in to Microsoft Graph" Style="{StaticResource PrimaryBtn}" HorizontalAlignment="Left"/>
                         <TextBlock x:Name="TxtConnectionStatus" Margin="0,10,0,0" FontSize="13" TextWrapping="Wrap"/>
                     </StackPanel>
@@ -206,13 +206,21 @@ function Clear-PolicyAssignments {
                         </Grid.RowDefinitions>
 
                         <!-- Scan filters -->
-                        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
-                            <TextBlock Text="Scan for:" VerticalAlignment="Center" Margin="0,0,12,0" Foreground="#555"/>
-                            <CheckBox x:Name="ChkPolicies"     Content="Provisioning Policies" IsChecked="True" Margin="0,0,14,0" VerticalAlignment="Center"/>
-                            <CheckBox x:Name="ChkUserSettings" Content="User Settings"          IsChecked="True" Margin="0,0,14,0" VerticalAlignment="Center"/>
-                            <CheckBox x:Name="ChkGroups"       Content="Entra ID Groups"        IsChecked="True" Margin="0,0,16,0" VerticalAlignment="Center"/>
-                            <Button x:Name="BtnScan" Content="Scan Tenant" Style="{StaticResource PrimaryBtn}"/>
-                        </StackPanel>
+                        <Grid Grid.Row="0" Margin="0,0,0,10">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <WrapPanel Grid.Column="0" VerticalAlignment="Center">
+                                <TextBlock Text="Scan for:" VerticalAlignment="Center" Margin="0,0,12,4" Foreground="#555"/>
+                                <CheckBox x:Name="ChkPolicies"     Content="Provisioning Policies" IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
+                                <CheckBox x:Name="ChkUserSettings" Content="User Settings"          IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
+                                <CheckBox x:Name="ChkGroups"       Content="Entra ID Groups"        IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
+                                <CheckBox x:Name="ChkUpdateRings"  Content="Update Rings"           IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
+                                <CheckBox x:Name="ChkAiConfigs"    Content="AI Configs"             IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
+                            </WrapPanel>
+                            <Button x:Name="BtnScan" Grid.Column="1" Content="Scan Tenant" Style="{StaticResource PrimaryBtn}" VerticalAlignment="Center"/>
+                        </Grid>
 
                         <!-- Status / count line -->
                         <TextBlock x:Name="TxtScanStatus" Grid.Row="1" Margin="0,0,0,8"
@@ -457,6 +465,47 @@ function Invoke-Scan {
             }
         }
 
+        if ((ctrl 'ChkUpdateRings').IsChecked) {
+            (ctrl 'TxtLoading').Text = "Scanning Windows Update rings..."
+            $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
+
+            # Match rings created by the deploy wizard (description marker) plus the
+            # default ring name, in case the description was edited in the portal.
+            $rings   = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations?`$select=id,displayName,description"
+            $matched = @($rings | Where-Object {
+                $_.description -like '*created by Deploy-Windows365-GUI*' -or
+                $_.displayName -eq 'W365-CloudPC-UpdateRing'
+            })
+
+            if ($matched.Count -gt 0) {
+                Add-SectionHeader "Windows Update Rings" "#B7950B"
+                foreach ($r in ($matched | Sort-Object displayName)) {
+                    $chk = Add-ItemCheckbox -Name $r.displayName -TypeTag "UpdateRing"
+                    $script:foundItems.Add(@{ Type='UpdateRing'; Id=$r.id; Name=$r.displayName; Checkbox=$chk })
+                }
+            }
+        }
+
+        if ((ctrl 'ChkAiConfigs').IsChecked) {
+            (ctrl 'TxtLoading').Text = "Scanning AI Cloud PC configurations..."
+            $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
+
+            try {
+                $profiles = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles"
+                $matched  = @($profiles | Where-Object { $_.displayName -eq 'W365_Frontier_AIEnabled' })
+
+                if ($matched.Count -gt 0) {
+                    Add-SectionHeader "AI Cloud PC Configurations" "#C77DBA"
+                    foreach ($p in ($matched | Sort-Object displayName)) {
+                        $chk = Add-ItemCheckbox -Name $p.displayName -TypeTag "AiConfig"
+                        $script:foundItems.Add(@{ Type='AiConfig'; Id=$p.id; Name=$p.displayName; Checkbox=$chk })
+                    }
+                }
+            } catch {
+                # settingProfiles endpoint is not available in all tenants — skip quietly
+            }
+        }
+
         Hide-Loading
 
         if ($script:foundItems.Count -eq 0) {
@@ -533,6 +582,28 @@ function Invoke-Delete {
                         Add-ResultRow "FAILED — $($item.Name): $_" -Success $false
                     }
                 }
+                'UpdateRing' {
+                    try {
+                        Invoke-MgGraphRequest -Method DELETE `
+                            -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations/$($item.Id)" `
+                            -ErrorAction Stop
+                        Add-ResultRow "Update Ring deleted: $($item.Name)" -Success $true
+                    } catch {
+                        Add-ResultRow "FAILED — $($item.Name): $_" -Success $false
+                    }
+                }
+                'AiConfig' {
+                    try {
+                        $assignUri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles/$($item.Id)/assign"
+                        Clear-PolicyAssignments -Uri $assignUri
+                        Invoke-MgGraphRequest -Method DELETE `
+                            -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles/$($item.Id)" `
+                            -ErrorAction Stop
+                        Add-ResultRow "AI Config deleted: $($item.Name)" -Success $true
+                    } catch {
+                        Add-ResultRow "FAILED — $($item.Name): $_" -Success $false
+                    }
+                }
             }
         }
 
@@ -561,7 +632,7 @@ function Invoke-Delete {
     Show-Loading "Connecting to Microsoft Graph..."
     try {
         Install-GraphModuleIfNeeded
-        Connect-MgGraph -Scopes "CloudPC.ReadWrite.All","Group.ReadWrite.All" -ErrorAction Stop
+        Connect-MgGraph -Scopes "CloudPC.ReadWrite.All","Group.ReadWrite.All","DeviceManagementConfiguration.ReadWrite.All" -ErrorAction Stop
         (ctrl 'TxtConnectionStatus').Text       = [char]0x2714 + "  Connected to Microsoft Graph"
         (ctrl 'TxtConnectionStatus').Foreground = [System.Windows.Media.SolidColorBrush]::new(
             [System.Windows.Media.Color]::FromRgb(16, 124, 16))

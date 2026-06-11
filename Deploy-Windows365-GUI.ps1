@@ -43,6 +43,12 @@ function Install-GraphModuleIfNeeded {
     }
 }
 
+# Escapes single quotes for OData $filter string literals (' → '')
+function Get-ODataEscaped {
+    param([Parameter(Mandatory)][string]$Value)
+    return $Value -replace "'", "''"
+}
+
 function Get-AllGraphItems {
     param([Parameter(Mandatory)][string]$Uri)
     $items    = @()
@@ -72,7 +78,7 @@ function Test-IsCopilotEligibleSku {
 
 function Get-OrCreateGroup {
     param([Parameter(Mandatory)][string]$DisplayName, [Parameter(Mandatory)][string]$Description)
-    $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+    $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$(Get-ODataEscaped $DisplayName)'" -ErrorAction Stop
     $existing = $response.value | Select-Object -First 1
     if ($existing) { return @{ Id = $existing.Id; Created = $false } }
     $mailNick = "grp-" + [guid]::NewGuid().ToString("N").Substring(0, 10)
@@ -87,7 +93,7 @@ function Get-OrCreateDynamicDeviceGroup {
         [Parameter(Mandatory)][string]$Description,
         [string]$MembershipRule = '(device.displayName -startsWith "CPC-")'
     )
-    $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+    $response = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$(Get-ODataEscaped $DisplayName)'" -ErrorAction Stop
     $existing = $response.value | Select-Object -First 1
     if ($existing) { return @{ Id = $existing.Id; Created = $false } }
     $mailNick = "grp-" + [guid]::NewGuid().ToString("N").Substring(0, 10)
@@ -106,7 +112,7 @@ function Get-OrCreateCloudPcUserSetting {
         [Parameter(Mandatory)][bool]$LocalAdminEnabled,
         [Parameter(Mandatory)][string]$TargetGroupId
     )
-    $response  = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+    $response  = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/userSettings?`$filter=displayName eq '$(Get-ODataEscaped $DisplayName)'" -ErrorAction Stop
     $existing  = $response.value | Select-Object -First 1
     $wasCreated = $false
     $settingAlreadyExisted = $null -ne $existing
@@ -153,7 +159,7 @@ function Get-OrCreateCloudPcAiConfig {
     )
 
     $response = Invoke-MgGraphRequest -Method GET `
-        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles?`$filter=displayName eq '$DisplayName'" `
+        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles?`$filter=displayName eq '$(Get-ODataEscaped $DisplayName)'" `
         -ErrorAction Stop
     $existing = $response.value | Select-Object -First 1
 
@@ -210,7 +216,7 @@ function Get-OrCreateProvisioningPolicy {
         [string]$ServicePlanId = $null,
         [string]$NamingTemplate = $null
     )
-    $response  = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop
+    $response  = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies?`$filter=displayName eq '$(Get-ODataEscaped $DisplayName)'" -ErrorAction Stop
     $existing  = $response.value | Select-Object -First 1
     $wasCreated = $false
     $policyAlreadyExisted = $null -ne $existing
@@ -331,20 +337,41 @@ function Get-OrCreateUpdateRing {
     param(
         [Parameter(Mandatory)][string]$DisplayName,
         [Parameter(Mandatory)][string]$DeviceGroupId,
-        [string]$Profile = 'standard'   # standard | recommended | deferred
+        [string]$RingProfile = 'standard'   # standard | recommended | deferred
     )
 
-    $qualityDays, $featureDays = switch ($Profile) {
+    $qualityDays, $featureDays = switch ($RingProfile) {
         'recommended' { 7,  30  }
         'deferred'    { 14, 180 }
         default       { 7,  0   }   # standard — feature updates follow Windows as a Service cadence
     }
 
     $response = Invoke-MgGraphRequest -Method GET `
-        -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations?`$filter=displayName eq '$DisplayName'" `
+        -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations?`$filter=displayName eq '$(Get-ODataEscaped $DisplayName)'" `
         -ErrorAction Stop
     $existing = $response.value | Select-Object -First 1
-    if ($existing) { return @{ Id = $existing.id; Created = $false } }
+    if ($existing) {
+        # Ring already exists — make sure it is still assigned to the devices group.
+        # Merge with any existing assignments rather than overwriting.
+        $existingGroupIds = @()
+        try {
+            $assignResp = Invoke-MgGraphRequest -Method GET `
+                -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations/$($existing.id)/assignments" -ErrorAction Stop
+            $existingGroupIds = @($assignResp.value | ForEach-Object { $_.target.groupId } | Where-Object { $_ })
+        } catch {}
+        if ($existingGroupIds -notcontains $DeviceGroupId) {
+            $allIds = @($existingGroupIds) + $DeviceGroupId
+            $mergePayload = @{
+                assignments = @($allIds | ForEach-Object {
+                    @{ target = @{ "@odata.type" = "#microsoft.graph.groupAssignmentTarget"; groupId = $_ } }
+                })
+            }
+            Invoke-MgGraphRequest -Method POST `
+                -Uri "https://graph.microsoft.com/beta/deviceManagement/deviceConfigurations/$($existing.id)/assign" `
+                -Body ($mergePayload | ConvertTo-Json -Depth 5) -ContentType "application/json" -ErrorAction Stop | Out-Null
+        }
+        return @{ Id = $existing.id; Created = $false }
+    }
 
     $params = @{
         "@odata.type"                      = "#microsoft.graph.windowsUpdateForBusinessConfiguration"
@@ -1071,7 +1098,13 @@ function Update-Summary {
         PolicyName     = "${policyRegionName}-W365-${policyTypePart}-${suffix}"
     }
 
-    $licAssignText   = if ($script:state.LicenseType -eq 'Enterprise') { "Automatic (group-based licensing)" } else { "Automatic — provisioning policy assigned with service plan allotment" }
+    $licAssignText   = if ($script:state.LicenseType -eq 'Enterprise') {
+                           "Automatic (group-based licensing)"
+                       } elseif ($script:state.FrontlineAssignSessions) {
+                           "Automatic — '$($script:state.FrontlineAllotmentName)' ($($script:state.FrontlineAllotmentCount) session(s))"
+                       } else {
+                           "Skipped — assign sessions in the Intune portal after deployment"
+                       }
     $updateRingText  = if ($script:state.CreateUpdateRing) { "$($script:state.UpdateRingProfile) profile  [$($script:state.UpdateRingName)]" } else { "Skipped" }
     if ($script:state.EnableAutopatch) { $updateRingText += "  +  Autopatch enabled" }
 
@@ -1311,7 +1344,7 @@ function Start-Deployment {
                 $rUpdateRing = Get-OrCreateUpdateRing `
                     -DisplayName   $script:state.UpdateRingName `
                     -DeviceGroupId $rDevices.Id `
-                    -Profile       $script:state.UpdateRingProfile
+                    -RingProfile   $script:state.UpdateRingProfile
             } catch {
                 $rUpdateRing = @{ Id = $null; Created = $false; Error = "$_" }
             }
@@ -1668,7 +1701,7 @@ function Move-Next {
     Show-Loading "Connecting to Microsoft Graph..."
     try {
         Install-GraphModuleIfNeeded
-        Connect-MgGraph -Scopes "User.ReadWrite.All","Application.ReadWrite.All","CloudPC.ReadWrite.All","Group.ReadWrite.All","LicenseAssignment.ReadWrite.All","DeviceManagementConfiguration.ReadWrite.All","DeviceManagementServiceConfig.ReadWrite.All" -ErrorAction Stop
+        Connect-MgGraph -Scopes "CloudPC.ReadWrite.All","Group.ReadWrite.All","LicenseAssignment.ReadWrite.All","DeviceManagementConfiguration.ReadWrite.All" -ErrorAction Stop
         $script:state.IsConnected = $true
         (ctrl 'TxtConnectionStatus').Text       = [char]0x2714 + "  Connected to Microsoft Graph"
         (ctrl 'TxtConnectionStatus').Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(16,124,16))
