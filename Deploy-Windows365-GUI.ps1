@@ -1185,27 +1185,44 @@ function Update-Summary {
                         } else { $null }
     $policyTypePart   = if ($flVariant) { "Frontline-$flVariant" } else { $script:state.LicenseType }
 
-    $script:state.CalculatedNames = @{
-        GroupPrefix    = $prefix
-        PolicySuffix   = $suffix
-        LicensingGroup = "${prefix}CloudPC_$($script:state.SelectedServicePlan.DisplayName)"
-        UserGroup      = "${prefix}-${licInfix}-${regionLabel}-User"
-        AdminGroup     = "${prefix}-${licInfix}-${regionLabel}-Admin"
-        DevicesGroup   = "${prefix}CloudPC-Devices"
-        PolicyName     = "${policyRegionName}-W365-${policyTypePart}-${suffix}"
+    if ($script:state.LicenseType -eq 'Reserve') {
+        # Reserve uses two dedicated groups (User + Admin) under the SG-W365R prefix.
+        # The Reserve licence and the provisioning policy are assigned to both; there
+        # is no separate licensing group or devices group (no update ring for Reserve).
+        $script:state.CalculatedNames = @{
+            GroupPrefix    = $prefix
+            PolicySuffix   = $suffix
+            LicensingGroup = $null
+            UserGroup      = "${prefix}R-${regionLabel}-User"
+            AdminGroup     = "${prefix}R-${regionLabel}-Admin"
+            DevicesGroup   = $null
+            PolicyName     = "${policyRegionName}-W365-Reserve-${suffix}"
+        }
+    } else {
+        $script:state.CalculatedNames = @{
+            GroupPrefix    = $prefix
+            PolicySuffix   = $suffix
+            LicensingGroup = "${prefix}CloudPC_$($script:state.SelectedServicePlan.DisplayName)"
+            UserGroup      = "${prefix}-${licInfix}-${regionLabel}-User"
+            AdminGroup     = "${prefix}-${licInfix}-${regionLabel}-Admin"
+            DevicesGroup   = "${prefix}CloudPC-Devices"
+            PolicyName     = "${policyRegionName}-W365-${policyTypePart}-${suffix}"
+        }
     }
 
     $licAssignText   = if ($script:state.LicenseType -eq 'Enterprise') {
                            "Automatic (group-based licensing)"
                        } elseif ($script:state.LicenseType -eq 'Reserve') {
-                           "Automatic — Reserve SKU assigned to the licensing group (group-based licensing)"
+                           "Automatic — Reserve SKU assigned to both Reserve groups (group-based licensing)"
                        } elseif ($script:state.FrontlineAssignSessions) {
                            "Automatic — '$($script:state.FrontlineAllotmentName)' ($($script:state.FrontlineAllotmentCount) session(s))"
                        } else {
                            "Skipped — assign sessions in the Intune portal after deployment"
                        }
-    $updateRingText  = if ($script:state.CreateUpdateRing) { "$($script:state.UpdateRingProfile) profile  [$($script:state.UpdateRingName)]" } else { "Skipped" }
-    if ($script:state.EnableAutopatch) { $updateRingText += "  +  Autopatch enabled" }
+    $updateRingText  = if ($script:state.LicenseType -eq 'Reserve') { "Not applicable for Reserve" }
+                       elseif ($script:state.CreateUpdateRing) { "$($script:state.UpdateRingProfile) profile  [$($script:state.UpdateRingName)]" }
+                       else { "Skipped" }
+    if ($script:state.LicenseType -ne 'Reserve' -and $script:state.EnableAutopatch) { $updateRingText += "  +  Autopatch enabled" }
 
     (ctrl 'SumLicenseType').Text  = $script:state.LicenseType
     (ctrl 'SumSKU').Text          = $script:state.SelectedServicePlan.DisplayName
@@ -1220,10 +1237,10 @@ function Update-Summary {
     (ctrl 'SumUpdateRing').Text   = $updateRingText
     (ctrl 'SumAutopilot').Text   = if ($script:state.SelectedAutopilotProfile) { $script:state.SelectedAutopilotProfile.name } else { "None — skipped" }
     (ctrl 'SumNaming').Text      = if ($script:state.DeviceNamingTemplate) { $script:state.DeviceNamingTemplate } else { "Default (not set)" }
-    (ctrl 'SumLicGroup').Text     = $script:state.CalculatedNames.LicensingGroup
+    (ctrl 'SumLicGroup').Text     = $script:state.CalculatedNames.LicensingGroup ?? "Not used — licence assigned to both Reserve groups"
     (ctrl 'SumUserGroup').Text    = $script:state.CalculatedNames.UserGroup
     (ctrl 'SumAdminGroup').Text   = $script:state.CalculatedNames.AdminGroup
-    (ctrl 'SumDevicesGroup').Text = $script:state.CalculatedNames.DevicesGroup
+    (ctrl 'SumDevicesGroup').Text = $script:state.CalculatedNames.DevicesGroup ?? "Not used for Reserve"
     (ctrl 'SumPolicy').Text       = $script:state.CalculatedNames.PolicyName
 }
 
@@ -1293,15 +1310,23 @@ function Start-Deployment {
     try {
         # ── Groups ────────────────────────────────────────────────────────
         Show-Loading "Creating Entra ID groups..."
-        $rLic     = Get-OrCreateGroup -DisplayName $names.LicensingGroup -Description "Windows 365 licensing group — service plan: $($script:state.SelectedServicePlan.Id)"
-        $rUser    = Get-OrCreateGroup -DisplayName $names.UserGroup       -Description "Windows 365 users in $($script:state.SelectedRegionDisplayName)"
-        $rAdmin   = Get-OrCreateGroup -DisplayName $names.AdminGroup      -Description "Windows 365 local admins in $($script:state.SelectedRegionDisplayName)"
-        $rDevices = Get-OrCreateDynamicDeviceGroup -DisplayName $names.DevicesGroup -Description "Dynamic group — all Windows 365 Cloud PC devices (CPC-* prefix)"
+        $isReserve = $script:state.LicenseType -eq 'Reserve'
+        $rUser  = Get-OrCreateGroup -DisplayName $names.UserGroup  -Description "Windows 365 $($script:state.LicenseType) users in $($script:state.SelectedRegionDisplayName)"
+        $rAdmin = Get-OrCreateGroup -DisplayName $names.AdminGroup -Description "Windows 365 $($script:state.LicenseType) local admins in $($script:state.SelectedRegionDisplayName)"
+        if ($isReserve) {
+            # Reserve: no separate licensing group (licence goes on both groups) and no
+            # devices group (no update ring). Licence + policy are assigned to both.
+            $rLic = $null; $rDevices = $null
+            $groupIdsToVerify = @($rUser.Id, $rAdmin.Id)
+        } else {
+            $rLic     = Get-OrCreateGroup -DisplayName $names.LicensingGroup -Description "Windows 365 licensing group — service plan: $($script:state.SelectedServicePlan.Id)"
+            $rDevices = Get-OrCreateDynamicDeviceGroup -DisplayName $names.DevicesGroup -Description "Dynamic group — all Windows 365 Cloud PC devices (CPC-* prefix)"
+            $groupIdsToVerify = @($rLic.Id, $rUser.Id, $rAdmin.Id)
+        }
 
         # Group replication wait — Entra ID can take 30-90 s to replicate new groups
         # across the directory. We wait an initial 30 s then verify each group is
         # reachable via Graph before proceeding; retry for up to 60 s more if not.
-        $groupIdsToVerify = @($rLic.Id, $rUser.Id, $rAdmin.Id)
         for ($i = 15; $i -gt 0; $i--) {
             (ctrl 'TxtLoading').Text = "Waiting for group replication ($i s)..."
             $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
@@ -1341,9 +1366,11 @@ function Start-Deployment {
                 $licResult = @{ SkuPartNumber = "⚠️ Could not auto-assign: $_"; Warning = "" }
             }
         } elseif ($script:state.LicenseType -eq 'Reserve') {
-            Show-Loading "Assigning Windows 365 Reserve licence to licensing group..."
+            Show-Loading "Assigning Windows 365 Reserve licence to the Reserve groups..."
             try {
-                $licResult = Set-GroupReserveLicense -GroupId $rLic.Id
+                # Licence both groups — members of either get a Reserve Cloud PC.
+                $licResult = Set-GroupReserveLicense -GroupId $rUser.Id
+                try { Set-GroupReserveLicense -GroupId $rAdmin.Id | Out-Null } catch {}
             } catch {
                 # Non-fatal — Reserve licences may not be purchased yet, or no Azure AD P1
                 $licResult = @{ SkuPartNumber = "⚠️ Could not auto-assign Reserve licence: $_"; Warning = "" }
@@ -1458,8 +1485,9 @@ function Start-Deployment {
         }
 
         # ── Windows Update for Business ring ─────────────────────────────
+        # Not applicable to Reserve (no devices group, ephemeral Cloud PCs).
         $rUpdateRing = $null
-        if ($script:state.CreateUpdateRing) {
+        if (-not $isReserve -and $script:state.CreateUpdateRing) {
             Show-Loading "Creating Windows Update for Business ring..."
             try {
                 $rUpdateRing = Get-OrCreateUpdateRing `
@@ -1482,10 +1510,10 @@ function Start-Deployment {
         (ctrl 'TxtResultHeading').Foreground = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(16,124,16))
 
         Add-ResultSection "Entra ID Groups"
-        Add-ResultRow "Licensing" $names.LicensingGroup -Created $rLic.Created
+        if (-not $isReserve) { Add-ResultRow "Licensing" $names.LicensingGroup -Created $rLic.Created }
         Add-ResultRow "Users"     $names.UserGroup      -Created $rUser.Created
         Add-ResultRow "Admins"    $names.AdminGroup     -Created $rAdmin.Created
-        Add-ResultRow "Devices"   $names.DevicesGroup   -Created $rDevices.Created
+        if (-not $isReserve) { Add-ResultRow "Devices"   $names.DevicesGroup   -Created $rDevices.Created }
 
         Add-ResultSection "Licence Assignment"
         if ($licResult) {
@@ -1518,19 +1546,21 @@ function Start-Deployment {
 
         Add-ResultSection "Provisioning Policy"
         Add-ResultRow "Policy" $names.PolicyName -Created $rPolicy.Created
-        if ($script:state.EnableAutopatch) {
+        if (-not $isReserve -and $script:state.EnableAutopatch) {
             Add-ResultNote "⚠️ Autopatch — manual step required (see Next Steps below)"
         }
 
-        Add-ResultSection "Windows Update"
-        if ($rUpdateRing) {
-            if ($rUpdateRing.Error) {
-                Add-ResultNote "⚠️ Update ring could not be created: $($rUpdateRing.Error)" "#C50F1F"
+        if (-not $isReserve) {
+            Add-ResultSection "Windows Update"
+            if ($rUpdateRing) {
+                if ($rUpdateRing.Error) {
+                    Add-ResultNote "⚠️ Update ring could not be created: $($rUpdateRing.Error)" "#C50F1F"
+                } else {
+                    Add-ResultRow "Update Ring" $script:state.UpdateRingName -Created $rUpdateRing.Created
+                }
             } else {
-                Add-ResultRow "Update Ring" $script:state.UpdateRingName -Created $rUpdateRing.Created
+                Add-ResultNote "Skipped."
             }
-        } else {
-            Add-ResultNote "Skipped."
         }
 
         # ── Autopilot device preparation profile ──────────────────────────
@@ -1573,9 +1603,9 @@ function Start-Deployment {
             }
         } elseif ($script:state.LicenseType -eq 'Reserve') {
             if ($licResult -and $licResult.SkuPartNumber -notlike '⚠️*') {
-                $script:state.ManualStepsText += "$step. Reserve Licence (DONE — Reserve SKU assigned to licensing group)`n   Group: $($names.LicensingGroup)`n   Add the users who need Reserve cover to this group.`n`n"
+                $script:state.ManualStepsText += "$step. Reserve Licence (DONE — Reserve SKU assigned to both Reserve groups)`n   Users : $($names.UserGroup)`n   Admin : $($names.AdminGroup)`n   Add the users who need Reserve cover to the appropriate group.`n`n"
             } else {
-                $script:state.ManualStepsText += "$step. Reserve Licence (MANUAL)`n   Assign a Windows 365 Reserve licence to '$($names.LicensingGroup)' (or directly to the users who need cover).`n`n"
+                $script:state.ManualStepsText += "$step. Reserve Licence (MANUAL)`n   Assign a Windows 365 Reserve licence to '$($names.UserGroup)' and '$($names.AdminGroup)' (or directly to the users who need cover).`n`n"
             }
             $step++
             $script:state.ManualStepsText += "$step. Provision Reserve Cloud PCs (ON DEMAND)`n   IMPORTANT: a user's Cloud PC is eligible to provision 7 days after their licence is assigned.`n   When a user needs cover: Intune > Devices > Provision Cloud PCs > open '$($names.PolicyName)' > Cloud PC Users > select user(s) > Provision.`n   The 10-day access period starts at provisioning; Deprovision (Return) when no longer needed to preserve remaining days.`n`n"
@@ -1590,9 +1620,11 @@ function Start-Deployment {
         }
         $step++
         $script:state.ManualStepsText += "$step. User & Admin Groups`n   User  : $($names.UserGroup)`n   Admin : $($names.AdminGroup)`n`n"; $step++
-        $script:state.ManualStepsText += "$step. Devices Group (auto-populates from CPC-* naming)`n   $($names.DevicesGroup)`n`n"; $step++
-        if ($script:state.EnableAutopatch) {
-            $script:state.ManualStepsText += "$step. Autopatch (MANUAL)`n   1. Open Intune admin centre > Devices > Windows 365 > Provisioning policies`n   2. Open '$($names.PolicyName)'`n   3. Under 'Windows updates', select 'Autopatch' and save.`n`n"; $step++
+        if (-not $isReserve) {
+            $script:state.ManualStepsText += "$step. Devices Group (auto-populates from CPC-* naming)`n   $($names.DevicesGroup)`n`n"; $step++
+            if ($script:state.EnableAutopatch) {
+                $script:state.ManualStepsText += "$step. Autopatch (MANUAL)`n   1. Open Intune admin centre > Devices > Windows 365 > Provisioning policies`n   2. Open '$($names.PolicyName)'`n   3. Under 'Windows updates', select 'Autopatch' and save.`n`n"; $step++
+            }
         }
         $script:state.ManualStepsText += "$step. Cross-Region DR (optional)`n   Intune admin centre > Devices > Cloud PCs > User settings.`n"
 
@@ -1662,6 +1694,34 @@ function Set-RegionPageMode {
         (ctrl 'TxtReserveRegionNote').Visibility = 'Collapsed'
         (ctrl 'TxtRegionGroupLabel').Text        = "Region Group"
         (ctrl 'PanelSpecificRegion').Visibility  = 'Visible'
+    }
+}
+
+function Initialize-AutopilotPage {
+    $script:state.AutopilotProfiles = @()
+    $lb = ctrl 'LbAutopilot'; $lb.Items.Clear()
+    $lb.Items.Add("None — skip Autopilot profile assignment")
+    $lb.SelectedIndex = 0
+    $status = ctrl 'TxtAutopilotStatus'
+    try {
+        $allPolicies = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?`$filter=technologies eq 'enrollment'&`$select=id,name,templateReference"
+        $profiles = @($allPolicies | Where-Object { $_.templateReference.templateDisplayName -eq 'Win365 Device Preparation' } | Sort-Object name)
+        $script:state.AutopilotProfiles = $profiles
+        $script:state.AutopilotProfiles | ForEach-Object { $lb.Items.Add($_.name) }
+        if ($script:state.AutopilotProfiles.Count -eq 0) {
+            $status.Text       = "No Autopilot device preparation profiles found in this tenant."
+            $status.Foreground = [System.Windows.Media.Brushes]::DimGray
+            $status.Visibility = 'Visible'
+        } else {
+            $status.Visibility = 'Collapsed'
+        }
+    } catch {
+        # Endpoint may vary by tenant configuration — allow the user to skip
+        $errMsg = try { ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch { $null }
+        if (-not $errMsg) { $errMsg = if ($_ -match '"message"\s*:\s*"([^"]+)"') { $Matches[1] } else { "endpoint unavailable" } }
+        $status.Text       = "⚠️ Could not load Autopilot profiles ($errMsg). Select 'None' to skip."
+        $status.Foreground = [System.Windows.Media.Brushes]::DarkGoldenrod
+        $status.Visibility = 'Visible'
     }
 }
 
@@ -1784,6 +1844,15 @@ function Move-Next {
             $lb = ctrl 'LbLanguage'
             if ($lb.SelectedIndex -lt 0) { Show-Alert "Please select a language." "Selection Required"; return }
             $script:state.SelectedLanguage = $script:state.FilteredLanguages[$lb.SelectedIndex]
+            # Reserve has no Windows Update ring / Autopatch — skip page 5.
+            if ($script:state.LicenseType -eq 'Reserve') {
+                $script:state.CreateUpdateRing = $false
+                $script:state.EnableAutopatch  = $false
+                Show-Loading "Retrieving Autopilot device preparation profiles..."
+                Initialize-AutopilotPage
+                Hide-Loading; Set-Page 6   # skip Windows Update (page 5)
+                return
+            }
             Set-Page 5
         }
 
@@ -1799,33 +1868,7 @@ function Move-Next {
             $script:state.EnableAutopatch = (ctrl 'ChkAutopatch').IsChecked
 
             Show-Loading "Retrieving Autopilot device preparation profiles..."
-            $script:state.AutopilotProfiles = @()
-            $lb = ctrl 'LbAutopilot'; $lb.Items.Clear()
-            $lb.Items.Add("None — skip Autopilot profile assignment")
-            $lb.SelectedIndex = 0
-
-            $status = ctrl 'TxtAutopilotStatus'
-            try {
-                $allPolicies = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/configurationPolicies?`$filter=technologies eq 'enrollment'&`$select=id,name,templateReference"
-                $profiles = @($allPolicies | Where-Object { $_.templateReference.templateDisplayName -eq 'Win365 Device Preparation' } | Sort-Object name)
-                $script:state.AutopilotProfiles = $profiles
-                $script:state.AutopilotProfiles | ForEach-Object { $lb.Items.Add($_.name) }
-
-                if ($script:state.AutopilotProfiles.Count -eq 0) {
-                    $status.Text       = "No Autopilot device preparation profiles found in this tenant."
-                    $status.Foreground = [System.Windows.Media.Brushes]::DimGray
-                    $status.Visibility = 'Visible'
-                } else {
-                    $status.Visibility = 'Collapsed'
-                }
-            } catch {
-                # Endpoint may vary by tenant configuration — allow the user to skip
-                $errMsg = try { ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch { $null }
-                if (-not $errMsg) { $errMsg = if ($_ -match '"message"\s*:\s*"([^"]+)"') { $Matches[1] } else { "endpoint unavailable" } }
-                $status.Text       = "⚠️ Could not load Autopilot profiles ($errMsg). Select 'None' to skip."
-                $status.Foreground = [System.Windows.Media.Brushes]::DarkGoldenrod
-                $status.Visibility = 'Visible'
-            }
+            Initialize-AutopilotPage
             Hide-Loading; Set-Page 6
         }
 
@@ -1979,10 +2022,12 @@ function Move-Next {
 (ctrl 'BtnNext').Add_Click({   Move-Next })
 (ctrl 'BtnBack').Add_Click({
     if ($script:currentPage -gt 0 -and $script:currentPage -lt $script:totalPages) {
-        # Reserve skips the SKU page (1) and the Image page (3), so Back jumps over them:
-        # Region (2) -> Connect (0), and Language (4) -> Geography (2).
+        # Reserve skips the SKU (1), Image (3), and Windows Update (5) pages, so Back
+        # jumps over them: Region(2)->Connect(0), Language(4)->Geography(2),
+        # Autopilot(6)->Language(4).
         $target = if ($script:state.LicenseType -eq 'Reserve' -and $script:currentPage -eq 2) { 0 }
                   elseif ($script:state.LicenseType -eq 'Reserve' -and $script:currentPage -eq 4) { 2 }
+                  elseif ($script:state.LicenseType -eq 'Reserve' -and $script:currentPage -eq 6) { 4 }
                   else { $script:currentPage - 1 }
         Set-Page $target
     }

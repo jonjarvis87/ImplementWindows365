@@ -64,6 +64,7 @@ Short-term, dedicated Cloud PCs for business continuity — when a primary devic
 - **Automatic image** — Reserve provisions the latest gallery image (`imageId: automatic`), so the Image page is skipped too. Pick a specific image later in Intune if needed.
 - **Geography only** — you pick a geography, and the service auto-selects the region within it (the wizard's region page collapses to a single geography list). The geography is written to `domainJoinConfigurations.geographicLocationType`.
 - **On-demand provisioning** — Cloud PCs are *not* created automatically. The wizard sets up the policy, groups, and licence assignment; you then provision per-user from Intune when cover is needed.
+- **Two groups, no extras** — Reserve creates just a User and an Admin group (`SG-W365R-<geography>-User` / `-Admin`), assigns both to the policy, and licenses both. There is no separate licensing or devices group, and the **Windows Update ring and Autopatch pages are skipped** (not applicable to Reserve's ephemeral Cloud PCs).
 - Up to 10 days of Cloud PC access per user per year. A user's Cloud PC is eligible to provision **7 days after** their Reserve licence is assigned.
 
 The wizard creates and assigns the Reserve provisioning policy (`provisioningType: reserve`) and attempts group-based licensing of the Reserve SKU. The post-deploy checklist (Copy Manual Steps) covers assigning licences to users and provisioning on demand.
@@ -96,7 +97,7 @@ The suffix (`Policy` by default) and group prefix (`SG-W365` by default) can be 
 | Admin | `SG-W365-ENT-Uksouth-Admin` |
 | Devices (dynamic) | `SG-W365CloudPC-Devices` |
 
-`ENT` is used for Enterprise deployments, `FL` for Frontline, and `RSV` for Reserve (where the region segment is the geography name, e.g. `SG-W365-RSV-Europe-User`).
+`ENT` is used for Enterprise deployments and `FL` for Frontline. Reserve uses a distinct `SG-W365R-<geography>-User` / `-Admin` pair (e.g. `SG-W365R-Europe-User`) and creates no licensing or devices group.
 
 ---
 
