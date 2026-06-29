@@ -222,13 +222,24 @@ function Get-OrCreateProvisioningPolicy {
     $policyAlreadyExisted = $null -ne $existing
 
     if (-not $existing) {
+        $isReserve = $ProvisioningType -eq 'reserve'
+        # Reserve: geography goes in geographicLocationType with regionGroup/regionName
+        # both literal "automatic"; the image is the service-picked "automatic" latest
+        # gallery image. (Captured from the Intune portal's own create call.)
+        $domainJoin = if ($isReserve) {
+            @{ type = "azureADJoin"; geographicLocationType = $RegionGroup; regionName = "automatic"; regionGroup = "automatic" }
+        } else {
+            @{ type = "azureADJoin"; regionGroup = $RegionGroup; regionName = $CountryRegion }
+        }
+        $effImageId      = if ($isReserve) { "automatic" } else { $ImageId }
+        $effImageDisplay = if ($isReserve) { "Automatic" } else { $ImageDisplayName }
         $params = @{
             displayName = $DisplayName; description = ""; provisioningType = $ProvisioningType
             userExperienceType = "cloudPc"; managedBy = "windows365"
-            imageId = $ImageId; imageDisplayName = $ImageDisplayName; imageType = "gallery"
+            imageId = $effImageId; imageDisplayName = $effImageDisplay; imageType = "gallery"
             microsoftManagedDesktop = @{ type = "notManaged"; profile = "" }
             enableSingleSignOn = $true
-            domainJoinConfigurations = @(@{ type = "azureADJoin"; regionGroup = $RegionGroup; regionName = $CountryRegion })
+            domainJoinConfigurations = @($domainJoin)
             windowsSettings = @{ language = $Language }
             cloudPcNamingTemplate = if ($NamingTemplate) { $NamingTemplate } else { $null }; scopeIds = @("0")
             userSettingsPersistenceEnabled = $UserSettingsPersistence
@@ -467,14 +478,15 @@ $script:AIEnabledRegions = @(
 #  Reserve selects a geography tier (cloudPcGeographicLocationType) — a curated
 #  coarse list, NOT the finer region groups returned by supportedRegions
 #  (europeUnion/unitedKingdom/france…). Value is written to the provisioning
-#  policy as regionGroup, with regionName left as "automatic". These are
-#  evolvable-enum values, covered by the Prefer: include-unknown-enum-members
-#  header that reserve policy creation already sends.
+#  policy's domainJoinConfigurations.geographicLocationType; regionGroup and
+#  regionName are both the literal "automatic" (per the portal's captured
+#  payload). These are evolvable-enum values, covered by the
+#  Prefer: include-unknown-enum-members header that reserve creation sends.
 # ════════════════════════════════════════════════════════════════════════════
 $script:ReserveGeographies = @(
     [pscustomobject]@{ Display = "Africa";                        Value = "africa" }
     [pscustomobject]@{ Display = "Asia";                          Value = "asia" }
-    [pscustomobject]@{ Display = "Australia & New Zealand (ANZ)"; Value = "australasia" }
+    [pscustomobject]@{ Display = "Australia & New Zealand (ANZ)"; Value = "australiaNewZealand" }
     [pscustomobject]@{ Display = "Canada";                        Value = "canada" }
     [pscustomobject]@{ Display = "Europe";                        Value = "europe" }
     [pscustomobject]@{ Display = "India";                         Value = "india" }
@@ -1148,16 +1160,17 @@ function Update-Summary {
     $prefix = (ctrl 'TxtGroupPrefix').Text.Trim(); if (-not $prefix) { $prefix = "SG-W365" }
     $suffix = (ctrl 'TxtPolicySuffix').Text.Trim(); if (-not $suffix) { $suffix = "Policy" }
 
-    # Reserve labels groups by geography (display name); other types by region.
-    $regionLabelSource = if ($script:state.LicenseType -eq 'Reserve') { $script:state.SelectedRegionDisplayName } else { $script:state.SelectedRegionName }
-    $regionLabel      = (Get-Culture).TextInfo.ToTitleCase(($regionLabelSource -replace '[_-]',' ').ToLower().Trim())
+    $regionLabel      = (Get-Culture).TextInfo.ToTitleCase(($script:state.SelectedRegionName -replace '[_-]',' ').ToLower().Trim())
     $policyRegionRaw  = $script:state.SelectedRegionDisplayName ?? $script:state.SelectedRegionName
     $policyRegionName = (Get-Culture).TextInfo.ToTitleCase($policyRegionRaw.ToLower().Trim())
-    # Strip spaces for Reserve only (geography names like "Europe Union"); leaving
-    # Enterprise/Frontline names untouched avoids changing existing group lookups.
     if ($script:state.LicenseType -eq 'Reserve') {
-        $regionLabel      = $regionLabel      -replace '\s',''
-        $policyRegionName = $policyRegionName -replace '\s',''
+        # Reserve names come from the clean geography enum value (e.g. "australiaNewZealand"),
+        # not the display label — which can contain characters invalid in a policy name
+        # (& ( )). Capitalise the first letter: europe -> Europe, usEast -> UsEast.
+        $geo   = $script:state.SelectedRegionGroup
+        $clean = ($geo.Substring(0,1).ToUpper() + $geo.Substring(1)) -replace '[^A-Za-z0-9]',''
+        $regionLabel      = $clean
+        $policyRegionName = $clean
     }
     $licInfix         = switch ($script:state.LicenseType) { "Frontline" { "FL" } "Reserve" { "RSV" } default { "ENT" } }
     $flVariant        = if ($script:state.LicenseType -eq "Frontline") {
@@ -1732,6 +1745,12 @@ function Move-Next {
                 $script:state.SelectedRegionName         = $selRegion.Value
                 $script:state.SelectedRegionId           = $selRegion.Id
             }
+            # Reserve always uses the automatic (latest) gallery image — skip the image page.
+            if ($script:state.LicenseType -eq 'Reserve') {
+                $script:state.SelectedImage = [pscustomobject]@{ id = "automatic"; displayName = "Automatic (latest gallery image)" }
+                Set-Page 4   # skip image (page 3)
+                return
+            }
             Show-Loading "Retrieving Windows 11 gallery images..."
             try {
                 $imgs = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/galleryImages"
@@ -1948,8 +1967,11 @@ function Move-Next {
 (ctrl 'BtnNext').Add_Click({   Move-Next })
 (ctrl 'BtnBack').Add_Click({
     if ($script:currentPage -gt 0 -and $script:currentPage -lt $script:totalPages) {
-        # Reserve skips the SKU page (1), so Back from Region (2) returns to Connect (0).
-        $target = if ($script:state.LicenseType -eq 'Reserve' -and $script:currentPage -eq 2) { 0 } else { $script:currentPage - 1 }
+        # Reserve skips the SKU page (1) and the Image page (3), so Back jumps over them:
+        # Region (2) -> Connect (0), and Language (4) -> Geography (2).
+        $target = if ($script:state.LicenseType -eq 'Reserve' -and $script:currentPage -eq 2) { 0 }
+                  elseif ($script:state.LicenseType -eq 'Reserve' -and $script:currentPage -eq 4) { 2 }
+                  else { $script:currentPage - 1 }
         Set-Page $target
     }
 })

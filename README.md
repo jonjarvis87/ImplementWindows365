@@ -61,7 +61,8 @@ For Frontline, session assignment to the provisioning policy is **optional** in 
 **Reserve**
 Short-term, dedicated Cloud PCs for business continuity — when a primary device is lost, broken, or unavailable. Reserve differs from the other types:
 - **Fixed size** — 4 vCPU / 16 GB / 128 GB. The SKU page is skipped.
-- **Geography only** — you pick a geography, and the service auto-selects the region within it (the wizard's region page collapses to a single geography list).
+- **Automatic image** — Reserve provisions the latest gallery image (`imageId: automatic`), so the Image page is skipped too. Pick a specific image later in Intune if needed.
+- **Geography only** — you pick a geography, and the service auto-selects the region within it (the wizard's region page collapses to a single geography list). The geography is written to `domainJoinConfigurations.geographicLocationType`.
 - **On-demand provisioning** — Cloud PCs are *not* created automatically. The wizard sets up the policy, groups, and licence assignment; you then provision per-user from Intune when cover is needed.
 - Up to 10 days of Cloud PC access per user per year. A user's Cloud PC is eligible to provision **7 days after** their Reserve licence is assigned.
 
