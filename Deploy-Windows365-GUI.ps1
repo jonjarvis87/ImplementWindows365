@@ -287,7 +287,9 @@ function Get-OrCreateProvisioningPolicy {
 
     # Retry the assign call — the Cloud PC backend has a slower replication cycle than
     # the main Graph directory, so groups that pass a GET check can still be "not found"
-    # here. Retry up to 10 times with a 10 s gap before giving up.
+    # here. The "groupId(s) not found" detail lives in error.innerError.message, so we
+    # match against both messages. Retry up to 12 times with a 10 s gap before giving up.
+    $assignMaxAttempts = 12
     $assignAttempt = 0
     $assignSuccess = $false
     do {
@@ -298,14 +300,19 @@ function Get-OrCreateProvisioningPolicy {
                 -Body $assignBody -ContentType "application/json" -ErrorAction Stop | Out-Null
             $assignSuccess = $true
         } catch {
-            $errBody = try { ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch { "$_" }
-            if ($errBody -match 'groupId.*not found' -and $assignAttempt -lt 10) {
+            $errBody = try {
+                $ge = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error
+                "$($ge.message) $($ge.innerError.message)"
+            } catch { "$_" }
+            if ($errBody -match 'not found|notFound|does not exist|replication' -and $assignAttempt -lt $assignMaxAttempts) {
+                (ctrl 'TxtLoading').Text = "Waiting for groups to replicate to the Cloud PC backend (assign retry $assignAttempt/$assignMaxAttempts)..."
+                $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
                 Start-Sleep -Seconds 10
             } else {
                 throw
             }
         }
-    } while (-not $assignSuccess -and $assignAttempt -lt 10)
+    } while (-not $assignSuccess -and $assignAttempt -lt $assignMaxAttempts)
 
     return @{ Id = $existing.id; Created = $wasCreated }
 }
@@ -1428,7 +1435,12 @@ function Start-Deployment {
                     $rawMsg = $null
                     try { $rawMsg = $_.ErrorDetails.Message } catch {}
                     if ($rawMsg) {
-                        try   { $flError = ($rawMsg | ConvertFrom-Json -ErrorAction Stop).error.message }
+                        try {
+                            # Combine error.message and innerError.message — the "groupId not
+                            # found" / validation detail usually lives in innerError.
+                            $ge = ($rawMsg | ConvertFrom-Json -ErrorAction Stop).error
+                            $flError = "$($ge.message) $($ge.innerError.message)".Trim()
+                        }
                         catch { $flError = $rawMsg }   # plain-text response — use as-is
                     } else {
                         $flError = $_.Exception.Message
