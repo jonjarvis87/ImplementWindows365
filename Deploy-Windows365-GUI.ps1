@@ -350,38 +350,9 @@ function Set-GroupLicense {
     return @{ SkuPartNumber = $matchingSku.skuPartNumber; Warning = $warning }
 }
 
-# ── Reserve licence assignment ────────────────────────────────────────────────
-# Windows 365 Reserve has no service-plan selection in this wizard, so we locate
-# the Reserve SKU by matching 'RESERVE' in the SKU part number or any of its
-# service plan names, then assign it to the licensing group. Matching by pattern
-# (rather than a hardcoded GUID) keeps this resilient to SKU identifier changes.
-function Set-GroupReserveLicense {
-    param([Parameter(Mandatory)][string]$GroupId)
-    $skus = Get-AllGraphItems -Uri "https://graph.microsoft.com/v1.0/subscribedSkus?`$select=skuId,skuPartNumber,servicePlans,consumedUnits,prepaidUnits"
-
-    $reserveSkus = @($skus | Where-Object {
-        $_.skuPartNumber -match 'RESERVE' -or
-        ($_.servicePlans | Where-Object { $_.servicePlanName -match 'RESERVE' })
-    })
-
-    if ($reserveSkus.Count -eq 0) {
-        throw "No Windows 365 Reserve SKU found in this tenant. Ensure Reserve licences are purchased before assigning."
-    }
-    $matchingSku = $reserveSkus | Select-Object -First 1
-
-    $available   = $matchingSku.prepaidUnits.enabled - $matchingSku.consumedUnits
-    $warning     = if ($available -le 0) { " ⚠️ No available units — assignment may fail for users." } else { "" }
-    if ($reserveSkus.Count -gt 1) { $warning += " ⚠️ Multiple Reserve SKUs found; assigned '$($matchingSku.skuPartNumber)'." }
-
-    $payload = @{
-        addLicenses    = @(@{ skuId = $matchingSku.skuId; disabledPlans = @() })
-        removeLicenses = @()
-    }
-    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/$GroupId/assignLicense" `
-        -Body ($payload | ConvertTo-Json -Depth 5) -ContentType "application/json" -ErrorAction Stop | Out-Null
-
-    return @{ SkuPartNumber = $matchingSku.skuPartNumber; Warning = $warning }
-}
+# Note: Reserve deliberately does NOT use group-based licensing. The Reserve SKU
+# isn't assignable to a group via assignLicense; the licence is consumed when the
+# policy (assigned to the Reserve groups) provisions a Cloud PC for a licensed user.
 
 # ── Windows Update for Business ring ─────────────────────────────────────────
 # Creates (or reuses) a WUfB configuration policy assigned to the devices group.
@@ -1213,7 +1184,7 @@ function Update-Summary {
     $licAssignText   = if ($script:state.LicenseType -eq 'Enterprise') {
                            "Automatic (group-based licensing)"
                        } elseif ($script:state.LicenseType -eq 'Reserve') {
-                           "Automatic — Reserve SKU assigned to both Reserve groups (group-based licensing)"
+                           "Allocated via policy assignment — assign Reserve licences to users (eligible 7 days after)"
                        } elseif ($script:state.FrontlineAssignSessions) {
                            "Automatic — '$($script:state.FrontlineAllotmentName)' ($($script:state.FrontlineAllotmentCount) session(s))"
                        } else {
@@ -1237,7 +1208,7 @@ function Update-Summary {
     (ctrl 'SumUpdateRing').Text   = $updateRingText
     (ctrl 'SumAutopilot').Text   = if ($script:state.SelectedAutopilotProfile) { $script:state.SelectedAutopilotProfile.name } else { "None — skipped" }
     (ctrl 'SumNaming').Text      = if ($script:state.DeviceNamingTemplate) { $script:state.DeviceNamingTemplate } else { "Default (not set)" }
-    (ctrl 'SumLicGroup').Text     = $script:state.CalculatedNames.LicensingGroup ?? "Not used — licence assigned to both Reserve groups"
+    (ctrl 'SumLicGroup').Text     = $script:state.CalculatedNames.LicensingGroup ?? "Not used for Reserve"
     (ctrl 'SumUserGroup').Text    = $script:state.CalculatedNames.UserGroup
     (ctrl 'SumAdminGroup').Text   = $script:state.CalculatedNames.AdminGroup
     (ctrl 'SumDevicesGroup').Text = $script:state.CalculatedNames.DevicesGroup ?? "Not used for Reserve"
@@ -1365,17 +1336,12 @@ function Start-Deployment {
                 # Non-fatal — tenant may not have Azure AD P1 or licence not purchased yet
                 $licResult = @{ SkuPartNumber = "⚠️ Could not auto-assign: $_"; Warning = "" }
             }
-        } elseif ($script:state.LicenseType -eq 'Reserve') {
-            Show-Loading "Assigning Windows 365 Reserve licence to the Reserve groups..."
-            try {
-                # Licence both groups — members of either get a Reserve Cloud PC.
-                $licResult = Set-GroupReserveLicense -GroupId $rUser.Id
-                try { Set-GroupReserveLicense -GroupId $rAdmin.Id | Out-Null } catch {}
-            } catch {
-                # Non-fatal — Reserve licences may not be purchased yet, or no Azure AD P1
-                $licResult = @{ SkuPartNumber = "⚠️ Could not auto-assign Reserve licence: $_"; Warning = "" }
-            }
         }
+        # Reserve does NOT use group-based licensing — the Reserve SKU isn't assignable
+        # to a group via assignLicense ("SKU contains invalid values"). The licence is
+        # allocated when the policy (assigned to the groups below) provisions a Cloud PC
+        # for a licensed user, so the wizard just assigns the policy and leaves licensing
+        # to a normal per-user (or group) Reserve licence assignment.
 
         # ── Cloud PC user settings ────────────────────────────────────────
         Show-Loading "Creating Cloud PC user settings..."
@@ -1525,6 +1491,8 @@ function Start-Deployment {
                 Add-ResultNote "⚠️ Frontline policy assignment failed: $($rFrontlineAssign.Error)" "#C50F1F"
                 Add-ResultNote "Manual step: open the provisioning policy in Intune and assign it to '$($names.UserGroup)' with service plan '$($script:state.SelectedServicePlan.DisplayName)'." "#666666"
             }
+        } elseif ($script:state.LicenseType -eq 'Reserve') {
+            Add-ResultNote "Reserve licences aren't group-assigned — the policy is assigned to both groups, and a licence is consumed when a user is provisioned. Assign a Windows 365 Reserve licence to your users (a user is eligible to provision 7 days after licensing)."
         } elseif ($script:state.LicenseType -eq 'Frontline') {
             Add-ResultNote "Skipped — configure session assignment in the Intune portal when ready."
         } else {
@@ -1602,11 +1570,7 @@ function Start-Deployment {
                 $script:state.ManualStepsText += "$step. Licence Assignment (MANUAL)`n   Assign '$($script:state.SelectedServicePlan.DisplayName)' to:`n   $($names.LicensingGroup)`n`n"
             }
         } elseif ($script:state.LicenseType -eq 'Reserve') {
-            if ($licResult -and $licResult.SkuPartNumber -notlike '⚠️*') {
-                $script:state.ManualStepsText += "$step. Reserve Licence (DONE — Reserve SKU assigned to both Reserve groups)`n   Users : $($names.UserGroup)`n   Admin : $($names.AdminGroup)`n   Add the users who need Reserve cover to the appropriate group.`n`n"
-            } else {
-                $script:state.ManualStepsText += "$step. Reserve Licence (MANUAL)`n   Assign a Windows 365 Reserve licence to '$($names.UserGroup)' and '$($names.AdminGroup)' (or directly to the users who need cover).`n`n"
-            }
+            $script:state.ManualStepsText += "$step. Reserve Licence (MANUAL)`n   The provisioning policy is already assigned to both groups:`n   Users : $($names.UserGroup)`n   Admin : $($names.AdminGroup)`n   Assign a Windows 365 Reserve licence to the users who need cover (per-user, or via group-based licensing if your tenant allows it). A user is eligible to provision 7 days after licensing.`n`n"
             $step++
             $script:state.ManualStepsText += "$step. Provision Reserve Cloud PCs (ON DEMAND)`n   IMPORTANT: a user's Cloud PC is eligible to provision 7 days after their licence is assigned.`n   When a user needs cover: Intune > Devices > Provision Cloud PCs > open '$($names.PolicyName)' > Cloud PC Users > select user(s) > Provision.`n   The 10-day access period starts at provisioning; Deprovision (Return) when no longer needed to preserve remaining days.`n`n"
         } else {
