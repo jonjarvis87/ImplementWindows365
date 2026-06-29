@@ -1579,10 +1579,16 @@ function Start-Deployment {
     }
     catch {
         Hide-Loading
+        # Surface the actual Graph error body (error.message), not the raw exception
+        # which only renders the HTTP status line and response headers.
+        $errDetail = $null
+        try   { $errDetail = ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch {}
+        if (-not $errDetail) { $errDetail = $_.ErrorDetails.Message }
+        if (-not $errDetail) { $errDetail = $_.Exception.Message }
         (ctrl 'TxtResultHeading').Text       = "Deployment Failed  ✗"
         (ctrl 'TxtResultHeading').Foreground = [System.Windows.Media.Brushes]::Crimson
         $errTb = New-Object System.Windows.Controls.TextBlock
-        $errTb.Text        = "Error: $_`n`nCheck that your account has the required permissions and that the Windows 365 licence is purchased in this tenant."
+        $errTb.Text        = "Error: $errDetail`n`nCheck that your account has the required permissions and that the Windows 365 licence is purchased in this tenant."
         $errTb.TextWrapping = 'Wrap'; $errTb.Foreground = [System.Windows.Media.Brushes]::Crimson
         (ctrl 'PanelResults').Children.Add($errTb) | Out-Null
         (ctrl 'BtnDeploy').IsEnabled = $true
