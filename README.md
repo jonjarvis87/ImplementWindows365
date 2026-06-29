@@ -78,7 +78,7 @@ The wizard creates and assigns the Reserve provisioning policy (`provisioningTyp
 | `Uksouth-W365-Enterprise-Policy` | Enterprise, UK South |
 | `Uksouth-W365-Frontline-Dedicated-Policy` | Frontline Dedicated, UK South |
 | `Uksouth-W365-Frontline-Shared-Policy` | Frontline Shared, UK South |
-| `EuropeUnion-W365-Reserve-Policy` | Reserve, Europe geography |
+| `Europe-W365-Reserve-Policy` | Reserve, Europe geography |
 
 The suffix (`Policy` by default) and group prefix (`SG-W365` by default) can be customised in the Advanced Options expander on the Review page.
 
@@ -95,7 +95,7 @@ The suffix (`Policy` by default) and group prefix (`SG-W365` by default) can be 
 | Admin | `SG-W365-ENT-Uksouth-Admin` |
 | Devices (dynamic) | `SG-W365CloudPC-Devices` |
 
-`ENT` is used for Enterprise deployments, `FL` for Frontline, and `RSV` for Reserve (where the region segment is the geography name, e.g. `SG-W365-RSV-EuropeUnion-User`).
+`ENT` is used for Enterprise deployments, `FL` for Frontline, and `RSV` for Reserve (where the region segment is the geography name, e.g. `SG-W365-RSV-Europe-User`).
 
 ---
 

@@ -462,6 +462,30 @@ $script:AIEnabledRegions = @(
     'southcentralus', 'canadacentral'
 )
 
+# ════════════════════════════════════════════════════════════════════════════
+#  WINDOWS 365 RESERVE GEOGRAPHIES
+#  Reserve selects a geography tier (cloudPcGeographicLocationType) — a curated
+#  coarse list, NOT the finer region groups returned by supportedRegions
+#  (europeUnion/unitedKingdom/france…). Value is written to the provisioning
+#  policy as regionGroup, with regionName left as "automatic". These are
+#  evolvable-enum values, covered by the Prefer: include-unknown-enum-members
+#  header that reserve policy creation already sends.
+# ════════════════════════════════════════════════════════════════════════════
+$script:ReserveGeographies = @(
+    [pscustomobject]@{ Display = "Africa";                        Value = "africa" }
+    [pscustomobject]@{ Display = "Asia";                          Value = "asia" }
+    [pscustomobject]@{ Display = "Australia & New Zealand (ANZ)"; Value = "australasia" }
+    [pscustomobject]@{ Display = "Canada";                        Value = "canada" }
+    [pscustomobject]@{ Display = "Europe";                        Value = "europe" }
+    [pscustomobject]@{ Display = "India";                         Value = "india" }
+    [pscustomobject]@{ Display = "Mexico";                        Value = "mexico" }
+    [pscustomobject]@{ Display = "Middle East";                   Value = "middleEast" }
+    [pscustomobject]@{ Display = "South America";                 Value = "southAmerica" }
+    [pscustomobject]@{ Display = "US Central";                    Value = "usCentral" }
+    [pscustomobject]@{ Display = "US East";                       Value = "usEast" }
+    [pscustomobject]@{ Display = "US West";                       Value = "usWest" }
+)
+
 function Test-IsAIEnabledRegion {
     param([Parameter(Mandatory)][string]$RegionDisplayName)
     $normalised = ($RegionDisplayName -replace '\s','').ToLower()
@@ -1636,14 +1660,17 @@ function Move-Next {
                 }
             }
             # Reserve has a fixed spec and no service-plan choice — skip the SKU page.
+            # It also uses the curated geography tier (see $script:ReserveGeographies),
+            # not the finer region groups from supportedRegions, so populate from the
+            # constant rather than a Graph call.
             if ($script:state.LicenseType -eq "Reserve") {
                 $script:state.SelectedServicePlan = [pscustomobject]@{ DisplayName = "Cloud PC Reserve 4vCPU/16GB/128GB"; Id = $null }
-                Show-Loading "Retrieving supported geographies..."
-                try {
-                    Initialize-RegionPage
-                } catch { Hide-Loading; Show-Alert "Failed to load geographies:`n$_" "Error" "Error"; return }
+                $script:state.AllRegions = @()
+                $lbGroup = ctrl 'LbRegionGroup'; $lbGroup.Items.Clear()
+                foreach ($g in $script:ReserveGeographies) { $lbGroup.Items.Add($g) }
+                $lbGroup.DisplayMemberPath = 'Display'
                 Set-RegionPageMode
-                Hide-Loading; Set-Page 2   # skip SKU (page 1)
+                Set-Page 2   # skip SKU (page 1)
                 return
             }
             Show-Loading "Retrieving Cloud PC service plans..."
