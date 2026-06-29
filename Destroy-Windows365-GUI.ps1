@@ -217,7 +217,7 @@ function Clear-PolicyAssignments {
                                 <CheckBox x:Name="ChkUserSettings" Content="User Settings"          IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
                                 <CheckBox x:Name="ChkGroups"       Content="Entra ID Groups"        IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
                                 <CheckBox x:Name="ChkUpdateRings"  Content="Update Rings"           IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
-                                <CheckBox x:Name="ChkAiConfigs"    Content="AI Configs"             IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
+                                <CheckBox x:Name="ChkAiConfigs"    Content="Setting Profiles"       IsChecked="True" Margin="0,0,14,4" VerticalAlignment="Center"/>
                             </WrapPanel>
                             <Button x:Name="BtnScan" Grid.Column="1" Content="Scan Tenant" Style="{StaticResource PrimaryBtn}" VerticalAlignment="Center"/>
                         </Grid>
@@ -487,15 +487,15 @@ function Invoke-Scan {
         }
 
         if ((ctrl 'ChkAiConfigs').IsChecked) {
-            (ctrl 'TxtLoading').Text = "Scanning AI Cloud PC configurations..."
+            (ctrl 'TxtLoading').Text = "Scanning Cloud PC setting profiles..."
             $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [Action]{})
 
             try {
                 $profiles = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles"
-                $matched  = @($profiles | Where-Object { $_.displayName -eq 'W365_Frontier_AIEnabled' })
+                $matched  = @($profiles | Where-Object { $_.displayName -in @('W365_Frontier_AIEnabled','W365R-Settings') })
 
                 if ($matched.Count -gt 0) {
-                    Add-SectionHeader "AI Cloud PC Configurations" "#C77DBA"
+                    Add-SectionHeader "Cloud PC Setting Profiles" "#C77DBA"
                     foreach ($p in ($matched | Sort-Object displayName)) {
                         $chk = Add-ItemCheckbox -Name $p.displayName -TypeTag "AiConfig"
                         $script:foundItems.Add(@{ Type='AiConfig'; Id=$p.id; Name=$p.displayName; Checkbox=$chk })

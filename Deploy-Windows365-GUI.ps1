@@ -202,6 +202,61 @@ function Get-OrCreateCloudPcAiConfig {
     return @{ Id = $existing.id; Created = $wasCreated }
 }
 
+# Reserve "Windows App settings" (W365.WindowsApp template) — lets users
+# self-provision and reset their Reserve Cloud PC from the Windows App.
+# Assignments are merged so deploying another geography accumulates groups.
+function Get-OrCreateReserveSettings {
+    param(
+        [Parameter(Mandatory)][string]$DisplayName,
+        [Parameter(Mandatory)][string[]]$TargetGroupIds   # Reserve User + Admin groups
+    )
+
+    $response = Invoke-MgGraphRequest -Method GET `
+        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles?`$filter=displayName eq '$(Get-ODataEscaped $DisplayName)'" `
+        -ErrorAction Stop
+    $existing = $response.value | Select-Object -First 1
+
+    if (-not $existing) {
+        $params = @{
+            displayName     = $DisplayName
+            description     = "Windows 365 Reserve — lets users self-provision and reset their Reserve Cloud PC from the Windows App"
+            profileType     = "template"
+            templateId      = "W365.WindowsApp"
+            roleScopeTagIds = @("0")
+            settings        = @(
+                @{ '@odata.type' = '#microsoft.graph.cloudPcBooleanSetting'; dataType = 'boolean'; settingDefinitionId = 'W365.WindowsApp.Customization.EnableSelfProvisioning'; platform = 'all'; isEnabled = $true }
+                @{ '@odata.type' = '#microsoft.graph.cloudPcBooleanSetting'; dataType = 'boolean'; settingDefinitionId = 'W365.WindowsApp.Customization.EnableReset';            platform = 'all'; isEnabled = $true }
+            )
+        }
+        $existing   = Invoke-MgGraphRequest -Method POST `
+            -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles" `
+            -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -ErrorAction Stop
+        $wasCreated = $true
+    } else {
+        $wasCreated = $false
+    }
+
+    # Merge existing assignments with the target groups (don't overwrite other geos)
+    $existingGroupIds = @()
+    try {
+        $exp = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles/$($existing.id)?`$expand=assignments" -ErrorAction Stop
+        if ($exp.assignments) { $existingGroupIds = @($exp.assignments | ForEach-Object { $_.target.groupId ?? $_.groupId } | Where-Object { $_ }) }
+    } catch {}
+
+    $allGroupIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($gid in $existingGroupIds)                          { if ($gid) { [void]$allGroupIds.Add($gid) } }
+    foreach ($gid in ($TargetGroupIds | Where-Object { $_ }))    { [void]$allGroupIds.Add($gid) }
+
+    $assignPayload = @{
+        assignments = @($allGroupIds | ForEach-Object { @{ groupId = $_; assignType = "group" } })
+    } | ConvertTo-Json -Depth 5
+    Invoke-MgGraphRequest -Method POST `
+        -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/settingProfiles/$($existing.id)/assign" `
+        -Body $assignPayload -ContentType "application/json" -ErrorAction Stop | Out-Null
+
+    return @{ Id = $existing.id; Created = $wasCreated }
+}
+
 function Get-OrCreateProvisioningPolicy {
     param(
         [Parameter(Mandatory)][string]$DisplayName,
@@ -1348,6 +1403,18 @@ function Start-Deployment {
         $rAdminSettings = Get-OrCreateCloudPcUserSetting -DisplayName "W365_AdminSettings" -LocalAdminEnabled $true  -TargetGroupId $rAdmin.Id
         $rUserSettings  = Get-OrCreateCloudPcUserSetting -DisplayName "W365_UserSettings"  -LocalAdminEnabled $false -TargetGroupId $rUser.Id
 
+        # Reserve also gets the Windows App settings (self-provisioning + reset).
+        $rReserveSettings = $null
+        if ($isReserve) {
+            Show-Loading "Creating Reserve Windows App settings (self-provisioning + reset)..."
+            try {
+                $rReserveSettings = Get-OrCreateReserveSettings -DisplayName "W365R-Settings" -TargetGroupIds @($rUser.Id, $rAdmin.Id)
+            } catch {
+                $errMsg = try { ($_.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop).error.message } catch { "$_" }
+                $rReserveSettings = @{ Id = $null; Created = $false; Error = $errMsg }
+            }
+        }
+
         # Reserve has a fixed sub-Copilot spec (4/16/128), so AI config never applies.
         $isCopilot   = ($script:state.LicenseType -ne 'Reserve') -and (Test-IsCopilotEligibleSku -DisplayName $script:state.SelectedServicePlan.DisplayName)
         $isAIRegion  = Test-IsAIEnabledRegion   -RegionDisplayName $script:state.SelectedRegionDisplayName
@@ -1502,6 +1569,13 @@ function Start-Deployment {
         Add-ResultSection "Cloud PC User Settings"
         Add-ResultRow "Admin Settings" "W365_AdminSettings" -Created $rAdminSettings.Created
         Add-ResultRow "User Settings"  "W365_UserSettings"  -Created $rUserSettings.Created
+        if ($isReserve -and $rReserveSettings) {
+            if ($rReserveSettings.Error) {
+                Add-ResultNote "⚠️ Reserve Windows App settings could not be created: $($rReserveSettings.Error)" "#C50F1F"
+            } else {
+                Add-ResultRow "Reserve Settings" "W365R-Settings — self-provisioning + reset" -Created $rReserveSettings.Created
+            }
+        }
         if ($isCopilot -and $isAIRegion) {
             if ($rAiConfig.Error) {
                 Add-ResultNote "⚠️ AI Cloud PC config could not be created: $($rAiConfig.Error)"

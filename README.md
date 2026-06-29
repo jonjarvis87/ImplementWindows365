@@ -66,6 +66,7 @@ Short-term, dedicated Cloud PCs for business continuity — when a primary devic
 - **On-demand provisioning** — Cloud PCs are *not* created automatically. The wizard sets up the policy, groups, and licence assignment; you then provision per-user from Intune when cover is needed.
 - **Two groups, no extras** — Reserve creates just a User and an Admin group (`SG-W365R-<geography>-User` / `-Admin`) and assigns both to the policy. There is no separate licensing or devices group, and the **Windows Update ring and Autopatch pages are skipped** (not applicable to Reserve's ephemeral Cloud PCs).
 - **No group-based licensing** — the Reserve SKU isn't group-assignable; the licence is consumed when the policy provisions a Cloud PC for a licensed user. Assign Reserve licences to your users (per-user, or group-based if your tenant allows it) — the wizard just sets up and assigns the policy.
+- **Windows App settings** — Reserve also creates a `W365R-Settings` profile (`W365.WindowsApp` template) assigned to both groups, enabling users to **self-provision** their Reserve Cloud PC and **reset** it from the Windows App.
 - Up to 10 days of Cloud PC access per user per year. A user's Cloud PC is eligible to provision **7 days after** their Reserve licence is assigned.
 
 The wizard creates and assigns the Reserve provisioning policy (`provisioningType: reserve`) and attempts group-based licensing of the Reserve SKU. The post-deploy checklist (Copy Manual Steps) covers assigning licences to users and provisioning on demand.
