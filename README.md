@@ -58,6 +58,15 @@ For Frontline, session assignment to the provisioning policy is **optional** in 
 - **Assignment name** — label shown in the Intune portal for the allotment
 - **Number of sessions** — sessions to reserve from your Frontline licence pool
 
+**Reserve**
+Short-term, dedicated Cloud PCs for business continuity — when a primary device is lost, broken, or unavailable. Reserve differs from the other types:
+- **Fixed size** — 4 vCPU / 16 GB / 128 GB. The SKU page is skipped.
+- **Geography only** — you pick a geography, and the service auto-selects the region within it (the wizard's region page collapses to a single geography list).
+- **On-demand provisioning** — Cloud PCs are *not* created automatically. The wizard sets up the policy, groups, and licence assignment; you then provision per-user from Intune when cover is needed.
+- Up to 10 days of Cloud PC access per user per year. A user's Cloud PC is eligible to provision **7 days after** their Reserve licence is assigned.
+
+The wizard creates and assigns the Reserve provisioning policy (`provisioningType: reserve`) and attempts group-based licensing of the Reserve SKU. The post-deploy checklist (Copy Manual Steps) covers assigning licences to users and provisioning on demand.
+
 ### Policy naming convention
 
 ```
@@ -69,6 +78,7 @@ For Frontline, session assignment to the provisioning policy is **optional** in 
 | `Uksouth-W365-Enterprise-Policy` | Enterprise, UK South |
 | `Uksouth-W365-Frontline-Dedicated-Policy` | Frontline Dedicated, UK South |
 | `Uksouth-W365-Frontline-Shared-Policy` | Frontline Shared, UK South |
+| `EuropeUnion-W365-Reserve-Policy` | Reserve, Europe geography |
 
 The suffix (`Policy` by default) and group prefix (`SG-W365` by default) can be customised in the Advanced Options expander on the Review page.
 
@@ -85,7 +95,7 @@ The suffix (`Policy` by default) and group prefix (`SG-W365` by default) can be 
 | Admin | `SG-W365-ENT-Uksouth-Admin` |
 | Devices (dynamic) | `SG-W365CloudPC-Devices` |
 
-`ENT` is used for Enterprise deployments; `FL` for Frontline.
+`ENT` is used for Enterprise deployments, `FL` for Frontline, and `RSV` for Reserve (where the region segment is the geography name, e.g. `SG-W365-RSV-EuropeUnion-User`).
 
 ---
 

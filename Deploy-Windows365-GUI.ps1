@@ -235,12 +235,15 @@ function Get-OrCreateProvisioningPolicy {
             userSettingsPersistenceConfiguration = @{ userSettingsPersistenceEnabled = $UserSettingsPersistence; userSettingsPersistenceStorageSizeCategory = "sixteenGB" }
             autopilotConfiguration = $null
         }
+        # 'reserve' is an evolvable-enum member; the Prefer header is required for
+        # Graph to accept it on write. Harmless for other provisioning types.
+        $extraHeaders = if ($ProvisioningType -eq 'reserve') { @{ Prefer = 'include-unknown-enum-members' } } else { @{} }
         try {
-            $existing = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -ErrorAction Stop
+            $existing = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -Headers $extraHeaders -ErrorAction Stop
         } catch {
             if ($params.windowsSettings.language -ne "en-GB") {
                 $params.windowsSettings.language = "en-GB"
-                $existing = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -ErrorAction Stop
+                $existing = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/provisioningPolicies" -Body ($params | ConvertTo-Json -Depth 6) -ContentType "application/json" -Headers $extraHeaders -ErrorAction Stop
             } else { throw }
         }
         $wasCreated = $true
@@ -318,6 +321,39 @@ function Set-GroupLicense {
 
     $available = $matchingSku.prepaidUnits.enabled - $matchingSku.consumedUnits
     $warning   = if ($available -le 0) { " ⚠️ No available units — assignment may fail for users." } else { "" }
+
+    $payload = @{
+        addLicenses    = @(@{ skuId = $matchingSku.skuId; disabledPlans = @() })
+        removeLicenses = @()
+    }
+    Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/groups/$GroupId/assignLicense" `
+        -Body ($payload | ConvertTo-Json -Depth 5) -ContentType "application/json" -ErrorAction Stop | Out-Null
+
+    return @{ SkuPartNumber = $matchingSku.skuPartNumber; Warning = $warning }
+}
+
+# ── Reserve licence assignment ────────────────────────────────────────────────
+# Windows 365 Reserve has no service-plan selection in this wizard, so we locate
+# the Reserve SKU by matching 'RESERVE' in the SKU part number or any of its
+# service plan names, then assign it to the licensing group. Matching by pattern
+# (rather than a hardcoded GUID) keeps this resilient to SKU identifier changes.
+function Set-GroupReserveLicense {
+    param([Parameter(Mandatory)][string]$GroupId)
+    $skus = Get-AllGraphItems -Uri "https://graph.microsoft.com/v1.0/subscribedSkus?`$select=skuId,skuPartNumber,servicePlans,consumedUnits,prepaidUnits"
+
+    $reserveSkus = @($skus | Where-Object {
+        $_.skuPartNumber -match 'RESERVE' -or
+        ($_.servicePlans | Where-Object { $_.servicePlanName -match 'RESERVE' })
+    })
+
+    if ($reserveSkus.Count -eq 0) {
+        throw "No Windows 365 Reserve SKU found in this tenant. Ensure Reserve licences are purchased before assigning."
+    }
+    $matchingSku = $reserveSkus | Select-Object -First 1
+
+    $available   = $matchingSku.prepaidUnits.enabled - $matchingSku.consumedUnits
+    $warning     = if ($available -le 0) { " ⚠️ No available units — assignment may fail for users." } else { "" }
+    if ($reserveSkus.Count -gt 1) { $warning += " ⚠️ Multiple Reserve SKUs found; assigned '$($matchingSku.skuPartNumber)'." }
 
     $payload = @{
         addLicenses    = @(@{ skuId = $matchingSku.skuId; disabledPlans = @() })
@@ -669,6 +705,11 @@ $script:SupportedLanguages = @(
                                         </StackPanel>
                                     </StackPanel>
                                 </StackPanel>
+
+                                <!-- Reserve -->
+                                <RadioButton x:Name="RbReserve" Content="Reserve" GroupName="LicenseType" Margin="0,0,0,2"/>
+                                <TextBlock TextWrapping="Wrap" Foreground="#666" FontSize="12" Margin="20,0,0,10"
+                                    Text="Short-term, dedicated Cloud PCs for business continuity — for when a primary device is lost, broken, or unavailable. Fixed size (4 vCPU / 16 GB / 128 GB) and up to 10 days of access per user per year. Cloud PCs are provisioned on demand from Intune, not automatically."/>
                             </StackPanel>
 
                         </StackPanel>
@@ -701,7 +742,11 @@ $script:SupportedLanguages = @(
                             <ColumnDefinition Width="*"/>
                         </Grid.ColumnDefinitions>
 
-                        <TextBlock Grid.Row="0" Grid.ColumnSpan="3" Text="Select Region" FontSize="15" FontWeight="SemiBold" Margin="0,0,0,12"/>
+                        <StackPanel Grid.Row="0" Grid.ColumnSpan="3" Margin="0,0,0,12">
+                            <TextBlock x:Name="TxtRegionPageTitle" Text="Select Region" FontSize="15" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="TxtReserveRegionNote" Foreground="#666" FontSize="12" Margin="0,4,0,0" TextWrapping="Wrap" Visibility="Collapsed"
+                                Text="Windows 365 Reserve selects a geography only — the service automatically provisions each Cloud PC in the best available region within it."/>
+                        </StackPanel>
 
                         <!-- Left panel — region group -->
                         <Grid Grid.Row="1" Grid.Column="0">
@@ -709,12 +754,12 @@ $script:SupportedLanguages = @(
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="*"/>
                             </Grid.RowDefinitions>
-                            <TextBlock Grid.Row="0" Text="Region Group" FontWeight="SemiBold" Foreground="#444" Margin="0,0,0,6"/>
+                            <TextBlock x:Name="TxtRegionGroupLabel" Grid.Row="0" Text="Region Group" FontWeight="SemiBold" Foreground="#444" Margin="0,0,0,6"/>
                             <ListBox x:Name="LbRegionGroup" Grid.Row="1" BorderBrush="#D0D0D0" HorizontalContentAlignment="Stretch"/>
                         </Grid>
 
                         <!-- Right panel — specific region -->
-                        <Grid Grid.Row="1" Grid.Column="2">
+                        <Grid x:Name="PanelSpecificRegion" Grid.Row="1" Grid.Column="2">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="*"/>
@@ -1039,7 +1084,7 @@ function Set-Page {
     param([int]$index)
     (ctrl 'WizardTabs').SelectedIndex = $index
     $script:currentPage = $index
-    (ctrl 'TxtPageTitle').Text = $script:pageTitles[$index]
+    (ctrl 'TxtPageTitle').Text = if ($index -eq 2 -and $script:state.LicenseType -eq 'Reserve') { 'Select Geography' } else { $script:pageTitles[$index] }
     # Results page (7) has no step count or Back button
     (ctrl 'TxtStepCount').Text    = if ($index -lt $script:totalPages) { "Step $($index + 1) of $script:totalPages" } else { "" }
     (ctrl 'BtnBack').IsEnabled    = ($index -gt 0 -and $index -lt $script:totalPages)
@@ -1079,10 +1124,18 @@ function Update-Summary {
     $prefix = (ctrl 'TxtGroupPrefix').Text.Trim(); if (-not $prefix) { $prefix = "SG-W365" }
     $suffix = (ctrl 'TxtPolicySuffix').Text.Trim(); if (-not $suffix) { $suffix = "Policy" }
 
-    $regionLabel      = (Get-Culture).TextInfo.ToTitleCase(($script:state.SelectedRegionName -replace '[_-]',' ').ToLower().Trim())
+    # Reserve labels groups by geography (display name); other types by region.
+    $regionLabelSource = if ($script:state.LicenseType -eq 'Reserve') { $script:state.SelectedRegionDisplayName } else { $script:state.SelectedRegionName }
+    $regionLabel      = (Get-Culture).TextInfo.ToTitleCase(($regionLabelSource -replace '[_-]',' ').ToLower().Trim())
     $policyRegionRaw  = $script:state.SelectedRegionDisplayName ?? $script:state.SelectedRegionName
     $policyRegionName = (Get-Culture).TextInfo.ToTitleCase($policyRegionRaw.ToLower().Trim())
-    $licInfix         = if ($script:state.LicenseType -eq "Frontline") { "FL" } else { "ENT" }
+    # Strip spaces for Reserve only (geography names like "Europe Union"); leaving
+    # Enterprise/Frontline names untouched avoids changing existing group lookups.
+    if ($script:state.LicenseType -eq 'Reserve') {
+        $regionLabel      = $regionLabel      -replace '\s',''
+        $policyRegionName = $policyRegionName -replace '\s',''
+    }
+    $licInfix         = switch ($script:state.LicenseType) { "Frontline" { "FL" } "Reserve" { "RSV" } default { "ENT" } }
     $flVariant        = if ($script:state.LicenseType -eq "Frontline") {
                             if ($script:state.FrontlineType -eq 'sharedByEntraGroup') { "Shared" } else { "Dedicated" }
                         } else { $null }
@@ -1100,6 +1153,8 @@ function Update-Summary {
 
     $licAssignText   = if ($script:state.LicenseType -eq 'Enterprise') {
                            "Automatic (group-based licensing)"
+                       } elseif ($script:state.LicenseType -eq 'Reserve') {
+                           "Automatic — Reserve SKU assigned to the licensing group (group-based licensing)"
                        } elseif ($script:state.FrontlineAssignSessions) {
                            "Automatic — '$($script:state.FrontlineAllotmentName)' ($($script:state.FrontlineAllotmentCount) session(s))"
                        } else {
@@ -1110,7 +1165,11 @@ function Update-Summary {
 
     (ctrl 'SumLicenseType').Text  = $script:state.LicenseType
     (ctrl 'SumSKU').Text          = $script:state.SelectedServicePlan.DisplayName
-    (ctrl 'SumRegion').Text       = "$($script:state.SelectedRegionDisplayName) ($($script:state.SelectedRegionGroup))"
+    (ctrl 'SumRegion').Text       = if ($script:state.LicenseType -eq 'Reserve') {
+                                        "Geography: $($script:state.SelectedRegionDisplayName) — region auto-selected by the service"
+                                    } else {
+                                        "$($script:state.SelectedRegionDisplayName) ($($script:state.SelectedRegionGroup))"
+                                    }
     (ctrl 'SumImage').Text        = $script:state.SelectedImage.displayName
     (ctrl 'SumLanguage').Text     = $script:state.SelectedLanguage.DisplayName
     (ctrl 'SumLicAssign').Text    = $licAssignText
@@ -1237,6 +1296,14 @@ function Start-Deployment {
                 # Non-fatal — tenant may not have Azure AD P1 or licence not purchased yet
                 $licResult = @{ SkuPartNumber = "⚠️ Could not auto-assign: $_"; Warning = "" }
             }
+        } elseif ($script:state.LicenseType -eq 'Reserve') {
+            Show-Loading "Assigning Windows 365 Reserve licence to licensing group..."
+            try {
+                $licResult = Set-GroupReserveLicense -GroupId $rLic.Id
+            } catch {
+                # Non-fatal — Reserve licences may not be purchased yet, or no Azure AD P1
+                $licResult = @{ SkuPartNumber = "⚠️ Could not auto-assign Reserve licence: $_"; Warning = "" }
+            }
         }
 
         # ── Cloud PC user settings ────────────────────────────────────────
@@ -1244,7 +1311,8 @@ function Start-Deployment {
         $rAdminSettings = Get-OrCreateCloudPcUserSetting -DisplayName "W365_AdminSettings" -LocalAdminEnabled $true  -TargetGroupId $rAdmin.Id
         $rUserSettings  = Get-OrCreateCloudPcUserSetting -DisplayName "W365_UserSettings"  -LocalAdminEnabled $false -TargetGroupId $rUser.Id
 
-        $isCopilot   = Test-IsCopilotEligibleSku -DisplayName $script:state.SelectedServicePlan.DisplayName
+        # Reserve has a fixed sub-Copilot spec (4/16/128), so AI config never applies.
+        $isCopilot   = ($script:state.LicenseType -ne 'Reserve') -and (Test-IsCopilotEligibleSku -DisplayName $script:state.SelectedServicePlan.DisplayName)
         $isAIRegion  = Test-IsAIEnabledRegion   -RegionDisplayName $script:state.SelectedRegionDisplayName
         $rAiConfig   = $null
         if ($isCopilot -and $isAIRegion) {
@@ -1264,7 +1332,11 @@ function Start-Deployment {
 
         # ── Provisioning policy ───────────────────────────────────────────
         Show-Loading "Creating provisioning policy..."
-        $provType        = if ($script:state.LicenseType -eq 'Frontline') { $script:state.FrontlineType ?? 'sharedByUser' } else { 'dedicated' }
+        $provType        = switch ($script:state.LicenseType) {
+            'Frontline' { $script:state.FrontlineType ?? 'sharedByUser' }
+            'Reserve'   { 'reserve' }
+            default     { 'dedicated' }
+        }
         $userPersistence = ($script:state.LicenseType -eq 'Frontline' -and $script:state.FrontlineType -eq 'sharedByEntraGroup')
         $servicePlanId   = if ($script:state.LicenseType -eq 'Frontline') { $script:state.SelectedServicePlan.Id } else { $null }
 
@@ -1450,6 +1522,14 @@ function Start-Deployment {
             } else {
                 $script:state.ManualStepsText += "$step. Licence Assignment (MANUAL)`n   Assign '$($script:state.SelectedServicePlan.DisplayName)' to:`n   $($names.LicensingGroup)`n`n"
             }
+        } elseif ($script:state.LicenseType -eq 'Reserve') {
+            if ($licResult -and $licResult.SkuPartNumber -notlike '⚠️*') {
+                $script:state.ManualStepsText += "$step. Reserve Licence (DONE — Reserve SKU assigned to licensing group)`n   Group: $($names.LicensingGroup)`n   Add the users who need Reserve cover to this group.`n`n"
+            } else {
+                $script:state.ManualStepsText += "$step. Reserve Licence (MANUAL)`n   Assign a Windows 365 Reserve licence to '$($names.LicensingGroup)' (or directly to the users who need cover).`n`n"
+            }
+            $step++
+            $script:state.ManualStepsText += "$step. Provision Reserve Cloud PCs (ON DEMAND)`n   IMPORTANT: a user's Cloud PC is eligible to provision 7 days after their licence is assigned.`n   When a user needs cover: Intune > Devices > Provision Cloud PCs > open '$($names.PolicyName)' > Cloud PC Users > select user(s) > Provision.`n   The 10-day access period starts at provisioning; Deprovision (Return) when no longer needed to preserve remaining days.`n`n"
         } else {
             if ($rFrontlineAssign -and $rFrontlineAssign.Success) {
                 $script:state.ManualStepsText += "$step. Frontline Licence Assignment (DONE — policy assigned with service plan allotment)`n   Policy   : $($names.PolicyName)`n   Group    : $($names.UserGroup)`n   Plan     : $($script:state.SelectedServicePlan.DisplayName)`n   Sessions : $($script:state.FrontlineAllotmentCount)`n`n"
@@ -1491,6 +1571,45 @@ function Start-Deployment {
 #  NAVIGATION
 # ════════════════════════════════════════════════════════════════════════════
 
+# Loads supported regions and populates the region-group (geography) list.
+# Shared by the Enterprise/Frontline SKU step and the Reserve step (which skips SKU).
+function Initialize-RegionPage {
+    $uri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/supportedRegions?`$filter=supportedSolution eq 'windows365'&`$select=id,displayName,regionGroup,geographicLocationType"
+    $raw = Get-AllGraphItems -Uri $uri
+    $raw = $raw | Where-Object { $null -eq ($_.geographicLocationType ?? $_.GeographicLocationType) }
+    $script:state.AllRegions = @($raw | ForEach-Object {
+        $rg  = $_.regionGroup ?? $_.RegionGroup
+        $dn  = $_.displayName ?? $_.DisplayName
+        $rid = ($_.id ?? $_.Id) -replace '\s',''   # internal name e.g. "uksouth"
+        [pscustomobject]@{ RegionGroup = $rg; DisplayName = $dn; RegionName = $dn; RegionId = $rid }
+    } | Sort-Object RegionGroup, DisplayName)
+
+    $uniqueGroups = @($script:state.AllRegions.RegionGroup | Sort-Object -Unique)
+    $lbGroup = ctrl 'LbRegionGroup'; $lbGroup.Items.Clear()
+    foreach ($g in $uniqueGroups) {
+        $words    = [regex]::Split($g, '(?<=[a-z])(?=[A-Z])')
+        $friendly = ($words | ForEach-Object { $_.Substring(0,1).ToUpper() + $_.Substring(1).ToLower() }) -join ' '
+        $lbGroup.Items.Add([pscustomobject]@{ Display = $friendly; Value = $g })
+    }
+    $lbGroup.DisplayMemberPath = 'Display'
+}
+
+# Toggles the region page between the standard two-list view (Enterprise/Frontline)
+# and the geography-only view used by Reserve.
+function Set-RegionPageMode {
+    if ($script:state.LicenseType -eq 'Reserve') {
+        (ctrl 'TxtRegionPageTitle').Text         = "Select Geography"
+        (ctrl 'TxtReserveRegionNote').Visibility = 'Visible'
+        (ctrl 'TxtRegionGroupLabel').Text        = "Geography"
+        (ctrl 'PanelSpecificRegion').Visibility  = 'Collapsed'
+    } else {
+        (ctrl 'TxtRegionPageTitle').Text         = "Select Region"
+        (ctrl 'TxtReserveRegionNote').Visibility = 'Collapsed'
+        (ctrl 'TxtRegionGroupLabel').Text        = "Region Group"
+        (ctrl 'PanelSpecificRegion').Visibility  = 'Visible'
+    }
+}
+
 function Move-Next {
     switch ($script:currentPage) {
 
@@ -1515,6 +1634,17 @@ function Move-Next {
                     $script:state.FrontlineAllotmentCount = $parsedSessions
                     $script:state.FrontlineAllotmentName  = $rawAllotmentName
                 }
+            }
+            # Reserve has a fixed spec and no service-plan choice — skip the SKU page.
+            if ($script:state.LicenseType -eq "Reserve") {
+                $script:state.SelectedServicePlan = [pscustomobject]@{ DisplayName = "Cloud PC Reserve 4vCPU/16GB/128GB"; Id = $null }
+                Show-Loading "Retrieving supported geographies..."
+                try {
+                    Initialize-RegionPage
+                } catch { Hide-Loading; Show-Alert "Failed to load geographies:`n$_" "Error" "Error"; return }
+                Set-RegionPageMode
+                Hide-Loading; Set-Page 2   # skip SKU (page 1)
+                return
             }
             Show-Loading "Retrieving Cloud PC service plans..."
             try {
@@ -1542,38 +1672,33 @@ function Move-Next {
             $script:state.SelectedServicePlan = $script:state.ServicePlans[$lb.SelectedIndex]
             Show-Loading "Retrieving supported regions..."
             try {
-                $uri = "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/supportedRegions?`$filter=supportedSolution eq 'windows365'&`$select=id,displayName,regionGroup,geographicLocationType"
-                $raw = Get-AllGraphItems -Uri $uri
-                $raw = $raw | Where-Object { $null -eq ($_.geographicLocationType ?? $_.GeographicLocationType) }
-                $script:state.AllRegions = @($raw | ForEach-Object {
-                    $rg = $_.regionGroup ?? $_.RegionGroup
-                    $dn = $_.displayName ?? $_.DisplayName
-                    $rid = ($_.id ?? $_.Id) -replace '\s','' # internal name e.g. "uksouth"
-                    [pscustomobject]@{ RegionGroup = $rg; DisplayName = $dn; RegionName = $dn; RegionId = $rid }
-                } | Sort-Object RegionGroup, DisplayName)
-
-                $uniqueGroups = @($script:state.AllRegions.RegionGroup | Sort-Object -Unique)
-                $lbGroup = ctrl 'LbRegionGroup'; $lbGroup.Items.Clear()
-                foreach ($g in $uniqueGroups) {
-                    $words    = [regex]::Split($g, '(?<=[a-z])(?=[A-Z])')
-                    $friendly = ($words | ForEach-Object { $_.Substring(0,1).ToUpper() + $_.Substring(1).ToLower() }) -join ' '
-                    $lbGroup.Items.Add([pscustomobject]@{ Display = $friendly; Value = $g })
-                }
-                $lbGroup.DisplayMemberPath = 'Display'
+                Initialize-RegionPage
             } catch { Hide-Loading; Show-Alert "Failed to load regions:`n$_" "Error" "Error"; return }
+            Set-RegionPageMode
             Hide-Loading; Set-Page 2
         }
 
-        2 { # Region
-            if ((ctrl 'LbRegionGroup').SelectedIndex -lt 0 -or (ctrl 'LbRegion').SelectedIndex -lt 0) {
-                Show-Alert "Please select both a region group and a specific region." "Selection Required"; return
+        2 { # Region (Geography only for Reserve)
+            if ($script:state.LicenseType -eq 'Reserve') {
+                if ((ctrl 'LbRegionGroup').SelectedIndex -lt 0) {
+                    Show-Alert "Please select a geography." "Selection Required"; return
+                }
+                $selGroup = (ctrl 'LbRegionGroup').SelectedItem
+                $script:state.SelectedRegionGroup       = $selGroup.Value
+                $script:state.SelectedRegionDisplayName  = $selGroup.Display
+                $script:state.SelectedRegionName         = "automatic"   # service auto-selects a region within the geography
+                $script:state.SelectedRegionId           = "automatic"
+            } else {
+                if ((ctrl 'LbRegionGroup').SelectedIndex -lt 0 -or (ctrl 'LbRegion').SelectedIndex -lt 0) {
+                    Show-Alert "Please select both a region group and a specific region." "Selection Required"; return
+                }
+                $selGroup  = (ctrl 'LbRegionGroup').SelectedItem
+                $selRegion = (ctrl 'LbRegion').SelectedItem
+                $script:state.SelectedRegionGroup        = $selGroup.Value
+                $script:state.SelectedRegionDisplayName  = $selRegion.Display
+                $script:state.SelectedRegionName         = $selRegion.Value
+                $script:state.SelectedRegionId           = $selRegion.Id
             }
-            $selGroup  = (ctrl 'LbRegionGroup').SelectedItem
-            $selRegion = (ctrl 'LbRegion').SelectedItem
-            $script:state.SelectedRegionGroup        = $selGroup.Value
-            $script:state.SelectedRegionDisplayName  = $selRegion.Display
-            $script:state.SelectedRegionName         = $selRegion.Value
-            $script:state.SelectedRegionId           = $selRegion.Id
             Show-Loading "Retrieving Windows 11 gallery images..."
             try {
                 $imgs = Get-AllGraphItems -Uri "https://graph.microsoft.com/beta/deviceManagement/virtualEndpoint/galleryImages"
@@ -1716,6 +1841,7 @@ function Move-Next {
 
 (ctrl 'RbEnterprise').Add_Checked({ $script:state.LicenseType = "Enterprise"; (ctrl 'PanelFrontlineType').Visibility = 'Collapsed' })
 (ctrl 'RbFrontline').Add_Checked({  $script:state.LicenseType = "Frontline";  (ctrl 'PanelFrontlineType').Visibility = 'Visible' })
+(ctrl 'RbReserve').Add_Checked({    $script:state.LicenseType = "Reserve";    (ctrl 'PanelFrontlineType').Visibility = 'Collapsed' })
 (ctrl 'RbFLDedicated').Add_Checked({ $script:state.FrontlineType = "sharedByUser" })
 (ctrl 'RbFLShared').Add_Checked({    $script:state.FrontlineType = "sharedByEntraGroup" })
 (ctrl 'ChkFLAssign').Add_Checked({   (ctrl 'PanelFLAssignment').Visibility = 'Visible' })
@@ -1787,7 +1913,13 @@ function Move-Next {
 
 (ctrl 'BtnRecalc').Add_Click({ Update-Summary })
 (ctrl 'BtnNext').Add_Click({   Move-Next })
-(ctrl 'BtnBack').Add_Click({   if ($script:currentPage -gt 0 -and $script:currentPage -lt $script:totalPages) { Set-Page ($script:currentPage - 1) } })
+(ctrl 'BtnBack').Add_Click({
+    if ($script:currentPage -gt 0 -and $script:currentPage -lt $script:totalPages) {
+        # Reserve skips the SKU page (1), so Back from Region (2) returns to Connect (0).
+        $target = if ($script:state.LicenseType -eq 'Reserve' -and $script:currentPage -eq 2) { 0 } else { $script:currentPage - 1 }
+        Set-Page $target
+    }
+})
 (ctrl 'BtnDeploy').Add_Click({ Start-Deployment })
 (ctrl 'BtnClose').Add_Click({  $window.Close() })
 (ctrl 'BtnCopySteps').Add_Click({
